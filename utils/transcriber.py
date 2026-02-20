@@ -164,8 +164,7 @@ def _extract_segment(audio_file_path, start_ms, end_ms, output_path):
         '-ss', str(start_sec),
         '-t', str(duration_sec),
         '-i', audio_file_path,
-        '-acodec', 'libmp3lame',
-        '-q:a', '4',
+        '-acodec', 'aac',
         output_path
     ]
     
