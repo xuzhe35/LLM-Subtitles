@@ -37,10 +37,11 @@ def ensure_dirs(base_path):
         os.makedirs(d, exist_ok=True)
     return dirs
 
-def process_video(url, lang=None, model=None, force_audio=False, source_lang=None, use_vad=False, whisper_prompt=None, max_segment_sec=None, engine='whisper', progress_callback=print):
+def process_video(url, lang=None, model=None, force_audio=False, source_lang=None, use_vad=False, whisper_prompt=None, max_segment_sec=None, engine='whisper', progress_callback=print, download_progress_callback=None):
     """
     Main processing logic, callable by UI.
     progress_callback: function to receive log strings.
+    download_progress_callback: function to receive yt-dlp percent string (e.g. "45.0%").
     """
     config = load_config()
 
@@ -53,7 +54,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
         progress_callback("Error: Missing OpenAI API key. Set OPENAI_API_KEY or config.json openai_api_key.")
         return
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, max_retries=0)
     target_lang = lang if lang else get_config_value(
         config,
         env_keys=["DEFAULT_TARGET_LANGUAGE"],
@@ -117,7 +118,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
     if found_manual_code:
         progress_callback(f"Downloading manual subtitle: {found_manual_code}")
         original_sub_path_base = os.path.join(dirs['original'], safe_title)
-        expected_filename = downloader.download_manual_subtitle(url, found_manual_code, original_sub_path_base)
+        expected_filename = downloader.download_manual_subtitle(url, found_manual_code, original_sub_path_base, progress_hook=download_progress_callback)
         
         if not expected_filename or not os.path.exists(expected_filename):
              potential = f"{original_sub_path_base}.{found_manual_code}.vtt"
@@ -156,7 +157,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
         else:
             # Fallback manual. Needs translation.
             progress_callback(f"Translating {len(original_segments)} segments to {target_lang}...")
-            translated_segments = translator.translate_segments(client, original_segments, target_lang, Model)
+            translated_segments = translator.translate_segments(client, original_segments, target_lang, Model, progress_callback=progress_callback)
 
     else:
         # 3. Audio Extraction & AI Flow
@@ -179,7 +180,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
             progress_callback(f"Audio already exists: {os.path.basename(audio_path)}, skipping download.")
         else:
             progress_callback("Downloading audio...")
-            audio_path = downloader.download_audio(url, audio_file_path)
+            audio_path = downloader.download_audio(url, audio_file_path, progress_hook=download_progress_callback)
             if not audio_path:
                  progress_callback("Error: Audio download failed.")
                  return
@@ -222,7 +223,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
              })
 
         progress_callback("Translating segments (LLM)...")
-        translated_segments = translator.translate_segments(client, original_segments, target_lang, Model)
+        translated_segments = translator.translate_segments(client, original_segments, target_lang, Model, progress_callback=progress_callback)
     
     # Generate Outputs
     progress_callback("Generating final files...")

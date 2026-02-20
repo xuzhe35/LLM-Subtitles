@@ -1,7 +1,7 @@
 import json
 import time
 
-def translate_segments(client, segments, target_lang, model="gpt-4o", batch_size=15):
+def translate_segments(client, segments, target_lang, model="gpt-4o", batch_size=15, progress_callback=print):
     """
     Translates transcript segments using an LLM.
     Processes in batches to avoid token limits and manage context.
@@ -11,11 +11,11 @@ def translate_segments(client, segments, target_lang, model="gpt-4o", batch_size
     total_batches = (len(segments) + batch_size - 1) // batch_size
     previous_context = [] 
     
-    print(f"Total segments: {len(segments)}. Processing in {total_batches} batches of {batch_size}...")
+    progress_callback(f"Total segments: {len(segments)}. Processing in {total_batches} batches of {batch_size}...")
 
     for i in range(0, len(segments), batch_size):
         batch_index = i // batch_size + 1
-        print(f"Translating batch {batch_index}/{total_batches}...")
+        progress_callback(f"Translating batch {batch_index}/{total_batches}...")
         
         batch = segments[i : i + batch_size]
         
@@ -47,16 +47,16 @@ def translate_segments(client, segments, target_lang, model="gpt-4o", batch_size
                     success = True
                     break
                 else:
-                    print(f"  Warning: Batch {batch_index} incomplete ({len(translated_map)}/{len(batch)}). Retrying ({attempt+1}/{max_retries})...")
+                    progress_callback(f"  Warning: Batch {batch_index} incomplete ({len(translated_map)}/{len(batch)}). Retrying ({attempt+1}/{max_retries})...")
                     attempt += 1
                     time.sleep(1) # Wait a bit before retry
             except Exception as e:
-                print(f"  Error translating batch {batch_index}: {e}. Retrying ({attempt+1}/{max_retries})...")
+                progress_callback(f"  Error translating batch {batch_index}: {e}. Retrying ({attempt+1}/{max_retries})...")
                 attempt += 1
                 time.sleep(1)
 
         if not success:
-             print(f"  Failed to translate batch {batch_index} completely after retries. Attempting individual fallback for missing segments...")
+             progress_callback(f"  Failed to translate batch {batch_index} completely after retries. Attempting individual fallback for missing segments...")
 
         for j, orig_seg in enumerate(batch):
             # j is the local ID we assigned above
@@ -64,12 +64,12 @@ def translate_segments(client, segments, target_lang, model="gpt-4o", batch_size
                 trans_text = translated_map[j]
             else:
                 # Attempt single-segment translation fallback
-                print(f"    [Fallback] Translating missing segment {j}: \"{orig_seg['text'][:50]}...\"")
-                trans_text = _translate_single_segment_fallback(client, orig_seg, target_lang, model)
+                progress_callback(f"    [Fallback] Translating missing segment {j}: \"{orig_seg['text'][:50]}...\"")
+                trans_text = _translate_single_segment_fallback(client, orig_seg, target_lang, model, progress_callback)
                 if trans_text != orig_seg['text']:
-                    print(f"    [Fallback] Success: \"{trans_text[:50]}...\"")
+                    progress_callback(f"    [Fallback] Success: \"{trans_text[:50]}...\"")
                 else:
-                    print(f"    [Fallback] Failed, kept original.")
+                    progress_callback(f"    [Fallback] Failed, kept original.")
             
             all_translated_segments.append({
                 "start": orig_seg['start'],
@@ -117,7 +117,8 @@ def _translate_batch_wrapper(client, segments, target_lang, model, previous_cont
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)}
             ],
-            response_format={ "type": "json_object" }
+            response_format={ "type": "json_object" },
+            timeout=60
         )
         
         content = response.choices[0].message.content
@@ -127,7 +128,7 @@ def _translate_batch_wrapper(client, segments, target_lang, model, previous_cont
         print(f"Error in translation wrapper: {e}")
         raise e
 
-def _translate_single_segment_fallback(client, segment, target_lang, model):
+def _translate_single_segment_fallback(client, segment, target_lang, model, progress_callback=print):
     """
     Fallback: Translates a single segment individually.
     Used when batch translation fails or skips a segment.
@@ -147,7 +148,8 @@ Output ONLY the translated text, no other commentary.
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": segment['text']}
-                ]
+                ],
+                timeout=30
             )
             
             translated_text = response.choices[0].message.content.strip()
@@ -155,9 +157,9 @@ Output ONLY the translated text, no other commentary.
                 return translated_text
             
         except Exception as e:
-            print(f"    [Fallback Error] Attempt {attempt+1}/{max_fallback_retries} failed: {e}")
+            progress_callback(f"    [Fallback Error] Attempt {attempt+1}/{max_fallback_retries} failed: {e}")
             time.sleep(1)
     
-    print(f"    [Fallback] All attempts failed, keeping original text.")
+    progress_callback(f"    [Fallback] All attempts failed, keeping original text.")
     return segment['text'] # Ultimate fallback to original
 

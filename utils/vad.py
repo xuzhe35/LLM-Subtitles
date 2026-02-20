@@ -67,6 +67,10 @@ def detect_speech_segments(audio_path, min_silence_len=1000, silence_thresh=-40,
     if dur_match:
         h, m, s = dur_match.groups()
         duration = float(h)*3600 + float(m)*60 + float(s)
+        
+    # ffmpeg silencedetect might omit silence_end if silence runs to EOF
+    if len(silence_starts) > len(silence_ends):
+        silence_ends.append(duration)
     
     # Construct speech segments (intervals between silences)
     speech_segments = []

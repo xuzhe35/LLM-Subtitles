@@ -102,6 +102,16 @@ class App:
         self.start_btn = ttk.Button(tab, text="Start Processing", command=self.start_processing)
         self.start_btn.pack(pady=10)
 
+        # Progress Bar
+        self.progress_frame = ttk.Frame(tab)
+        self.progress_frame.pack(fill='x', padx=10, pady=5)
+        self.progress_label = ttk.Label(self.progress_frame, text="Download Progress:")
+        self.progress_label.pack(side='left', padx=(0, 5))
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient='horizontal', mode='determinate', length=400)
+        self.progress_bar.pack(side='left', fill='x', expand=True)
+        self.progress_bar['value'] = 0
+        self.progress_frame.pack_forget() # Hide initially
+
         # Log Area (Shared?)
         self.log_area = scrolledtext.ScrolledText(tab, height=15)
         self.log_area.pack(fill='both', expand=True, padx=5, pady=5)
@@ -140,6 +150,20 @@ class App:
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, filename)
 
+    def update_progress_bar(self, percent_str):
+        # percent_str is something like "45.0%"
+        try:
+            val = float(percent_str.strip('%'))
+            def _update():
+                if val > 0 and not self.progress_frame.winfo_ismapped():
+                    self.progress_frame.pack(fill='x', padx=10, pady=5, before=self.log_area)
+                self.progress_bar['value'] = val
+                if val >= 100:
+                    self.root.after(2000, lambda: self.progress_frame.pack_forget())
+            self.root.after(0, _update)
+        except ValueError:
+            pass
+
     def start_processing(self):
         url = self.url_entry.get()
         lang = self.lang_entry.get()
@@ -168,12 +192,14 @@ class App:
                     url, lang, model, force_audio=force_audio, 
                     source_lang=source_lang, use_vad=use_vad, 
                     whisper_prompt=whisper_prompt, max_segment_sec=max_segment_sec,
-                    engine=engine, progress_callback=self.log
+                    engine=engine, progress_callback=self.log,
+                    download_progress_callback=self.update_progress_bar
                 )
             except Exception as e:
                 self.log(f"Error: {e}")
             finally:
                 self.root.after(0, lambda: self.start_btn.config(state='normal'))
+                self.root.after(0, lambda: self.progress_frame.pack_forget())
 
         threading.Thread(target=run, daemon=True).start()
 

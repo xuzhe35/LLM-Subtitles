@@ -62,7 +62,7 @@ def split_audio(file_path, chunk_size_mb=24):
 
     for i in range(safe_num_chunks):
         start_time = i * safe_chunk_duration
-        output_file = f"{base_name}_part{i}{ext}"
+        output_file = f"{base_name}_part{i}.mp3"
         
         # ffmpeg -i input.mp3 -ss 00:00:30 -t 00:00:10 -c copy output.mp3
         # allow re-encoding if copy fails or to ensure clean cuts? 
@@ -96,7 +96,8 @@ def split_audio(file_path, chunk_size_mb=24):
             '-ss', str(start_time),
             '-t', str(safe_chunk_duration),
             '-i', file_path,
-            '-c', 'copy',
+            '-acodec', 'libmp3lame',
+            '-q:a', '4',
             output_file
         ]
         

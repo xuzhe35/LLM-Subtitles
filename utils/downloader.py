@@ -1,5 +1,18 @@
 import yt_dlp
 import os
+import re
+
+def _yt_dlp_progress_hook(d, hook_fn):
+    if d['status'] == 'downloading':
+        # p is usually a string like " 45.0%" or "N/A%"
+        p = d.get('_percent_str', '').strip()
+        # Remove ANSI color codes yt-dlp might add
+        p = re.sub(r'\x1b[^m]*m', '', p)
+        if hook_fn and p and p != 'N/A%':
+            hook_fn(p)
+    elif d['status'] == 'finished':
+        if hook_fn:
+            hook_fn("100%")
 
 def get_video_info(url):
     """
@@ -18,7 +31,7 @@ def get_video_info(url):
             print(f"Error extracting video info: {e}")
             return None
 
-def download_manual_subtitle(url, lang_code, output_path):
+def download_manual_subtitle(url, lang_code, output_path, progress_hook=None):
     """
     Downloads the manual subtitle for the given language code.
     """
@@ -29,6 +42,10 @@ def download_manual_subtitle(url, lang_code, output_path):
         'outtmpl': output_path,
         'quiet': True,
     }
+    
+    if progress_hook:
+        ydl_opts['progress_hooks'] = [lambda d: _yt_dlp_progress_hook(d, progress_hook)]
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             ydl.download([url])
@@ -40,7 +57,7 @@ def download_manual_subtitle(url, lang_code, output_path):
             print(f"Error downloading subtitle: {e}")
             return None
 
-def download_audio(url, output_path):
+def download_audio(url, output_path, progress_hook=None):
     """
     Downloads audio from the video, converting to MP3.
     """
@@ -55,6 +72,9 @@ def download_audio(url, output_path):
         'quiet': True,
     }
     
+    if progress_hook:
+        ydl_opts['progress_hooks'] = [lambda d: _yt_dlp_progress_hook(d, progress_hook)]
+        
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
