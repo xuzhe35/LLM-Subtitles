@@ -317,7 +317,7 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
     """
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
-    chunk_path = f"{audio_file_path}_seg_{seg_index}.mp3"
+    chunk_path = f"{audio_file_path}_seg_{seg_index}.m4a"
     
     # Extract segment
     if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
