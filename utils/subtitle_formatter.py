@@ -88,7 +88,7 @@ def generate_srt(segments, output_path):
         for i, segment in enumerate(segments):
             start = format_timestamp(segment['start'])
             end = format_timestamp(segment['end'])
-            text = segment['text']
+            text = segment.get('text', '').strip()
             
             f.write(f"{i+1}\n")
             f.write(f"{start} --> {end}\n")
@@ -135,7 +135,13 @@ def generate_bilingual_srt(original_segments, translated_segments, output_path):
             
             # Combine
             # Style: Translated on top (Target), Original below.
-            combined_text = f"{trans_text}\n{orig_text}"
+            texts_to_combine = []
+            if trans_text.strip():
+                texts_to_combine.append(trans_text.strip())
+            if orig_text.strip():
+                texts_to_combine.append(orig_text.strip())
+                
+            combined_text = "\n".join(texts_to_combine)
             
             f.write(f"{i+1}\n")
             f.write(f"{start} --> {end}\n")
