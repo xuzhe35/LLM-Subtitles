@@ -98,6 +98,8 @@ def split_audio(file_path, chunk_size_mb=24):
             '-i', file_path,
             '-acodec', 'libmp3lame',
             '-q:a', '4',
+            '-write_xing', '0',
+            '-id3v2_version', '3',
             output_file
         ]
         
