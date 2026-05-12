@@ -1,5 +1,6 @@
 import os
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import audio_splitter
@@ -14,6 +15,180 @@ GOOGLE_API_MAX_SEGMENT_MS = 59 * 1000  # 59 seconds
 # Overlap between adjacent segments (ms). Compensates for Whisper dropping
 # content near segment boundaries — a known issue with non-English audio.
 SEGMENT_OVERLAP_MS = 10 * 1000  # 10 seconds
+
+TRANSCRIPTION_MODEL_AUTO = "auto"
+TRANSCRIPTION_MODEL_OPENAI = "openai-whisper-1"
+TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE = "gpt-4o-transcribe-diarize"
+TRANSCRIPTION_MODEL_GOOGLE = "google-speech"
+TRANSCRIPTION_MODEL_TYPHOON = "typhoon-whisper-large-v3"
+TYPHOON_HF_MODEL_ID = "typhoon-ai/typhoon-whisper-large-v3"
+
+_VALID_TRANSCRIPTION_MODELS = {
+    TRANSCRIPTION_MODEL_AUTO,
+    TRANSCRIPTION_MODEL_OPENAI,
+    TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE,
+    TRANSCRIPTION_MODEL_GOOGLE,
+    TRANSCRIPTION_MODEL_TYPHOON,
+}
+_TYPHOON_PIPELINE = None
+
+
+class TranscriptResult:
+    def __init__(self, segments):
+        self.segments = segments
+
+
+def _report(progress_callback, message):
+    if progress_callback:
+        progress_callback(message)
+    else:
+        print(message)
+
+
+def _is_thai_source_language(source_lang):
+    if not source_lang:
+        return False
+    normalized = str(source_lang).strip().lower().replace("_", "-")
+    return normalized in {"th", "thai", "th-th"} or normalized.startswith("th-")
+
+
+def resolve_transcription_model(engine, source_lang, requested=TRANSCRIPTION_MODEL_AUTO):
+    """
+    Resolve the concrete transcription model from the current engine and source language.
+    Explicit engine/model choices win. Thai auto-routing only applies to engine='auto'.
+    """
+    requested = requested or TRANSCRIPTION_MODEL_AUTO
+    if requested not in _VALID_TRANSCRIPTION_MODELS:
+        raise ValueError(f"Unsupported transcription model: {requested}")
+
+    if requested != TRANSCRIPTION_MODEL_AUTO:
+        return requested
+
+    normalized_engine = (engine or "whisper").strip().lower()
+    if normalized_engine in {"gpt-4o-transcribe-diarize", "openai-gpt-4o-transcribe-diarize", "diarize"}:
+        return TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE
+    if normalized_engine in {"typhoon", "typhoon-whisper", "typhoon-whisper-large-v3"}:
+        return TRANSCRIPTION_MODEL_TYPHOON
+    if normalized_engine == "google":
+        return TRANSCRIPTION_MODEL_GOOGLE
+    if normalized_engine == "whisper":
+        return TRANSCRIPTION_MODEL_OPENAI
+
+    if _is_thai_source_language(source_lang):
+        return TRANSCRIPTION_MODEL_TYPHOON
+
+    return TRANSCRIPTION_MODEL_OPENAI
+
+
+def _select_torch_device(torch_module):
+    if torch_module.cuda.is_available():
+        return "cuda:0", torch_module.bfloat16
+
+    mps_backend = getattr(getattr(torch_module, "backends", None), "mps", None)
+    if mps_backend and mps_backend.is_available():
+        return "mps", torch_module.float16
+
+    return "cpu", torch_module.float32
+
+
+def _get_typhoon_pipeline(progress_callback=print):
+    global _TYPHOON_PIPELINE
+    if _TYPHOON_PIPELINE is not None:
+        return _TYPHOON_PIPELINE
+
+    try:
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+    except ImportError as e:
+        raise RuntimeError(
+            "Missing optional dependencies for Typhoon ASR. "
+            "Install with: pip install transformers accelerate huggingface_hub"
+        ) from e
+
+    device, torch_dtype = _select_torch_device(torch)
+    _report(progress_callback, f"Loading Typhoon ASR model: {TYPHOON_HF_MODEL_ID} ({device})")
+    started = time.perf_counter()
+
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        TYPHOON_HF_MODEL_ID,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    )
+    model.to(device)
+    processor = AutoProcessor.from_pretrained(TYPHOON_HF_MODEL_ID)
+
+    _TYPHOON_PIPELINE = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        max_new_tokens=448,
+        chunk_length_s=30,
+        batch_size=16,
+        return_timestamps=True,
+        torch_dtype=torch_dtype,
+        device=device,
+    )
+    _report(progress_callback, f"Typhoon ASR model loaded in {time.perf_counter() - started:.1f}s.")
+    return _TYPHOON_PIPELINE
+
+
+def _coerce_timestamp_pair(timestamp):
+    if not isinstance(timestamp, (list, tuple)) or len(timestamp) != 2:
+        return None
+    start, end = timestamp
+    if start is None or end is None:
+        return None
+    return float(start), float(end)
+
+
+def _normalize_typhoon_segments(result, audio_file_path):
+    segments = []
+    chunks = result.get("chunks", []) if isinstance(result, dict) else []
+
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        text = str(chunk.get("text", "")).strip()
+        timestamp = _coerce_timestamp_pair(chunk.get("timestamp"))
+        if not text or not timestamp:
+            continue
+        start, end = timestamp
+        if end <= start:
+            continue
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": text,
+        })
+
+    if segments:
+        return segments
+
+    text = result.get("text", "").strip() if isinstance(result, dict) else ""
+    if not text:
+        return []
+
+    duration = audio_splitter.get_audio_duration(audio_file_path)
+    return [{
+        "start": 0.0,
+        "end": float(duration) if duration else 0.0,
+        "text": text,
+    }]
+
+
+def _transcribe_audio_typhoon(audio_file_path, progress_callback=print):
+    _report(progress_callback, "Transcribing with Typhoon Whisper Large v3 (Thai)...")
+    started = time.perf_counter()
+    pipe = _get_typhoon_pipeline(progress_callback=progress_callback)
+    result = pipe(
+        audio_file_path,
+        generate_kwargs={"language": "thai"},
+    )
+    segments = _normalize_typhoon_segments(result, audio_file_path)
+    _report(progress_callback, f"Typhoon transcription finished in {time.perf_counter() - started:.1f}s ({len(segments)} segments).")
+    return TranscriptResult(segments)
 
 
 def _filter_hallucinations(segments, max_repeat=5):
@@ -158,6 +333,7 @@ def _extract_segment(audio_file_path, start_ms, end_ms, output_path):
     """Extract a single segment from audio using ffmpeg with re-encoding for precision."""
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
+    started = time.perf_counter()
     
     cmd = [
         'ffmpeg', '-y',
@@ -170,6 +346,7 @@ def _extract_segment(audio_file_path, start_ms, end_ms, output_path):
     
     try:
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        print(f"  Extracted segment {start_sec:.1f}-{start_sec+duration_sec:.1f}s in {time.perf_counter() - started:.1f}s: {output_path}")
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error extracting segment {start_sec:.1f}-{start_sec+duration_sec:.1f}s: {e.stderr.decode()[:200]}")
@@ -187,6 +364,7 @@ def _transcribe_single_segment_google(api_key, audio_file_path, seg_index, start
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
     chunk_path_flac = f"{audio_file_path}_seg_{seg_index}.flac"
+    started = time.perf_counter()
     
     # Max words per subtitle line (Thai words are short, so allow more)
     MAX_WORDS_PER_SUB = 12
@@ -222,6 +400,7 @@ def _transcribe_single_segment_google(api_key, audio_file_path, seg_index, start
             }
         }
         
+        print(f"  Uploading segment {seg_index+1} to Google Speech API; waiting for response...")
         response = requests.post(url, json=data)
         if response.status_code != 200:
             print(f"  Google API Error {response.status_code}: {response.text}")
@@ -318,6 +497,7 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
     chunk_path = f"{audio_file_path}_seg_{seg_index}.m4a"
+    started = time.perf_counter()
     
     # Extract segment
     if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
@@ -336,6 +516,7 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
                 whisper_kwargs['language'] = source_lang
             if whisper_prompt:
                 whisper_kwargs['prompt'] = whisper_prompt
+            print(f"  Uploading segment {seg_index+1} to OpenAI whisper-1; waiting for response...")
             transcript = client.audio.transcriptions.create(**whisper_kwargs)
         
         # Parse and remap timestamps
@@ -358,7 +539,7 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
             })
         
         print(f"  Segment {seg_index+1}: {len(result_segments)} text segments "
-              f"({start_sec:.0f}s-{start_sec+duration_sec:.0f}s, lang={source_lang or 'auto'})")
+              f"({start_sec:.0f}s-{start_sec+duration_sec:.0f}s, lang={source_lang or 'auto'}, {time.perf_counter() - started:.1f}s)")
         return (seg_index, result_segments)
         
     except Exception as e:
@@ -369,7 +550,118 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
             os.remove(chunk_path)
 
 
-def transcribe_audio(client, audio_file_path, source_lang=None, use_vad=False, whisper_prompt=None, max_segment_sec=None, engine='whisper', google_api_key=None):
+def _get_transcript_segments(transcript):
+    if isinstance(transcript, dict):
+        return transcript.get('segments', [])
+    return getattr(transcript, 'segments', [])
+
+
+def _get_transcript_text(transcript):
+    if isinstance(transcript, dict):
+        return transcript.get('text', '')
+    return getattr(transcript, 'text', '')
+
+
+def _normalize_diarized_segments(transcript, time_offset=0.0, fallback_duration=None):
+    result_segments = []
+    for seg in _get_transcript_segments(transcript):
+        if isinstance(seg, dict):
+            s_start = seg.get('start')
+            s_end = seg.get('end')
+            s_text = seg.get('text', '')
+        else:
+            s_start = getattr(seg, 'start', None)
+            s_end = getattr(seg, 'end', None)
+            s_text = getattr(seg, 'text', '')
+
+        if s_start is None or s_end is None:
+            continue
+        text = str(s_text).strip()
+        if not text:
+            continue
+        result_segments.append({
+            'start': float(s_start) + time_offset,
+            'end': float(s_end) + time_offset,
+            'text': text
+        })
+
+    if result_segments:
+        return result_segments
+
+    text = str(_get_transcript_text(transcript)).strip()
+    if not text:
+        return []
+
+    return [{
+        'start': time_offset,
+        'end': time_offset + float(fallback_duration or 0.0),
+        'text': text
+    }]
+
+
+def _transcribe_diarize_file(client, audio_file_path, time_offset=0.0, fallback_duration=None):
+    started = time.perf_counter()
+    with open(audio_file_path, "rb") as audio_file:
+        print(f"  Uploading {audio_file_path} to OpenAI gpt-4o-transcribe-diarize; waiting for response...")
+        transcript = client.audio.transcriptions.create(
+            model=TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE,
+            file=audio_file,
+            response_format="diarized_json",
+            chunking_strategy="auto"
+        )
+
+    segments = _normalize_diarized_segments(
+        transcript,
+        time_offset=time_offset,
+        fallback_duration=fallback_duration
+    )
+    print(f"  gpt-4o diarize API finished in {time.perf_counter() - started:.1f}s: {audio_file_path} ({len(segments)} segments)")
+    return segments
+
+
+def _transcribe_single_segment_diarize(client, audio_file_path, seg_index, start_ms, end_ms):
+    """
+    Extract and transcribe a segment with GPT-4o diarized transcription.
+    Speaker labels are ignored; start/end/text are normalized for SRT generation.
+    """
+    start_sec = start_ms / 1000.0
+    duration_sec = (end_ms - start_ms) / 1000.0
+    chunk_path = f"{audio_file_path}_seg_{seg_index}.m4a"
+    started = time.perf_counter()
+
+    if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
+        return (seg_index, [])
+
+    try:
+        result_segments = _transcribe_diarize_file(
+            client,
+            chunk_path,
+            time_offset=start_sec,
+            fallback_duration=duration_sec
+        )
+        print(f"  Segment {seg_index+1} (gpt-4o diarize): {len(result_segments)} text segments "
+              f"({start_sec:.0f}s-{start_sec+duration_sec:.0f}s, {time.perf_counter() - started:.1f}s)")
+        return (seg_index, result_segments)
+    except Exception as e:
+        print(f"  Error transcribing segment {seg_index+1} with gpt-4o diarize: {e}")
+        return (seg_index, [])
+    finally:
+        if os.path.exists(chunk_path):
+            os.remove(chunk_path)
+
+
+def transcribe_audio(
+    client,
+    audio_file_path,
+    source_lang=None,
+    use_vad=False,
+    whisper_prompt=None,
+    max_segment_sec=None,
+    engine='whisper',
+    google_api_key=None,
+    transcription_model=TRANSCRIPTION_MODEL_AUTO,
+    progress_callback=print,
+):
     """
     Transcribes audio using OpenAI Whisper or Google Speech.
     
@@ -382,11 +674,24 @@ def transcribe_audio(client, audio_file_path, source_lang=None, use_vad=False, w
         max_segment_sec: Max duration per chunk. For Google, FORCE < 60s.
         engine: 'whisper' or 'google'.
         google_api_key: API Key for Google Speech.
+        transcription_model: Concrete ASR model id, or 'auto' to resolve from source language/engine.
+        progress_callback: Optional logger for user-visible progress and errors.
     """
     if not os.path.exists(audio_file_path):
         raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
 
     try:
+        transcription_started = time.perf_counter()
+        resolved_model = resolve_transcription_model(engine, source_lang, transcription_model)
+        if resolved_model == TRANSCRIPTION_MODEL_TYPHOON:
+            return _transcribe_audio_typhoon(audio_file_path, progress_callback=progress_callback)
+
+        use_openai_diarize = resolved_model == TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE
+        if use_openai_diarize and whisper_prompt:
+            _report(progress_callback, "Whisper Prompt ignored for gpt-4o-transcribe-diarize.")
+
+        engine = "google" if resolved_model == TRANSCRIPTION_MODEL_GOOGLE else "whisper"
+
         # Resolve max segment duration
         if engine == 'google':
             max_segment_ms = GOOGLE_API_MAX_SEGMENT_MS
@@ -454,6 +759,11 @@ def transcribe_audio(client, audio_file_path, source_lang=None, use_vad=False, w
                             _transcribe_single_segment_google,
                             google_api_key, audio_file_path, i, start_ms, end_ms, google_lang
                         )
+                    elif use_openai_diarize:
+                        future = executor.submit(
+                            _transcribe_single_segment_diarize,
+                            client, audio_file_path, i, start_ms, end_ms
+                        )
                     else:
                         future = executor.submit(
                             _transcribe_single_segment,
@@ -481,42 +791,62 @@ def transcribe_audio(client, audio_file_path, source_lang=None, use_vad=False, w
         
         # ===== Fallback Path: standard chunking (no VAD) =====
         else:
+            split_started = time.perf_counter()
             chunks = audio_splitter.split_audio(audio_file_path)
+            print(f"Audio split step returned {len(chunks)} chunk(s) in {time.perf_counter() - split_started:.1f}s.")
             time_offset = 0.0
             
             for i, chunk_path in enumerate(chunks):
+                chunk_started = time.perf_counter()
+                before_chunk_segments = len(all_segments)
                 print(f"Transcribing chunk {i+1}/{len(chunks)}: {chunk_path}")
-                with open(chunk_path, "rb") as audio_file:
-                    whisper_kwargs = {
-                        'model': 'whisper-1',
-                        'file': audio_file,
-                        'response_format': 'verbose_json',
-                        'timestamp_granularities': ['segment']
-                    }
-                    if source_lang:
-                        whisper_kwargs['language'] = source_lang
-                    if whisper_prompt:
-                        whisper_kwargs['prompt'] = whisper_prompt
-                    transcript = client.audio.transcriptions.create(**whisper_kwargs)
-                
-                chunk_segments = transcript.segments if hasattr(transcript, 'segments') else (
-                    transcript.get('segments', []) if isinstance(transcript, dict) else []
-                )
 
-                for segment in chunk_segments:
-                    if hasattr(segment, 'start'):
-                        s_start, s_end, s_text = segment.start, segment.end, segment.text
-                    elif isinstance(segment, dict):
-                        s_start, s_end, s_text = segment['start'], segment['end'], segment['text']
-                    
-                    all_segments.append({
-                        'start': s_start + time_offset,
-                        'end': s_end + time_offset,
-                        'text': s_text
-                    })
-
+                duration_started = time.perf_counter()
                 duration = audio_splitter.get_audio_duration(chunk_path)
+                print(f"  Duration probe finished in {time.perf_counter() - duration_started:.1f}s for chunk {i+1}/{len(chunks)}.")
+                if use_openai_diarize:
+                    all_segments.extend(_transcribe_diarize_file(
+                        client,
+                        chunk_path,
+                        time_offset=time_offset,
+                        fallback_duration=duration
+                    ))
+                else:
+                    with open(chunk_path, "rb") as audio_file:
+                        whisper_kwargs = {
+                            'model': 'whisper-1',
+                            'file': audio_file,
+                            'response_format': 'verbose_json',
+                            'timestamp_granularities': ['segment']
+                        }
+                        if source_lang:
+                            whisper_kwargs['language'] = source_lang
+                        if whisper_prompt:
+                            whisper_kwargs['prompt'] = whisper_prompt
+                        print(f"  Uploading chunk {i+1}/{len(chunks)} to OpenAI whisper-1; waiting for response...")
+                        transcript = client.audio.transcriptions.create(**whisper_kwargs)
+                    
+                    chunk_segments = transcript.segments if hasattr(transcript, 'segments') else (
+                        transcript.get('segments', []) if isinstance(transcript, dict) else []
+                    )
+
+                    for segment in chunk_segments:
+                        if hasattr(segment, 'start'):
+                            s_start, s_end, s_text = segment.start, segment.end, segment.text
+                        elif isinstance(segment, dict):
+                            s_start, s_end, s_text = segment['start'], segment['end'], segment['text']
+                        
+                        all_segments.append({
+                            'start': s_start + time_offset,
+                            'end': s_end + time_offset,
+                            'text': s_text
+                        })
+
+                if duration is None:
+                    raise RuntimeError(f"Could not determine duration for chunk: {chunk_path}")
                 time_offset += duration
+                print(f"Finished transcribing chunk {i+1}/{len(chunks)} in {time.perf_counter() - chunk_started:.1f}s "
+                      f"({len(all_segments) - before_chunk_segments} new segments).")
                 
                 if chunk_path != audio_file_path:
                     try:
@@ -531,15 +861,12 @@ def transcribe_audio(client, audio_file_path, source_lang=None, use_vad=False, w
                   f"suspicious segments ({len(all_segments)} → {len(filtered_segments)}).")
         all_segments = filtered_segments
 
-        # Return result
-        class TranscriptResult:
-            def __init__(self, segments):
-                self.segments = segments
-        
+        print(f"Transcription finished in {time.perf_counter() - transcription_started:.1f}s ({len(all_segments)} segments).")
         return TranscriptResult(all_segments)
 
     except Exception as e:
-        print(f"Error during transcription: {e}")
-        import traceback
-        traceback.print_exc()
+        _report(progress_callback, f"Error during transcription: {e}")
+        if not isinstance(e, RuntimeError):
+            import traceback
+            traceback.print_exc()
         return None

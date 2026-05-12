@@ -5,7 +5,7 @@ A powerful tool to automatically download, transcribe, and translate YouTube vid
 ## Features
 
 -   **YouTube Downloader**: Automatically extracts audio and metadata from YouTube links.
--   **Smart Transcription**: Uses **OpenAI Whisper** or **Google Speech-to-Text** for high-accuracy transcription.
+-   **Smart Transcription**: Uses **OpenAI Whisper**, **Google Speech-to-Text**, or optional **Typhoon Whisper Large v3** for Thai audio.
 -   **LLM Translation**: Translates subtitles into your target language (e.g., Simplified Chinese) using **GPT-4o**, preserving context and nuance.
 -   **Bilingual Output**: Generates bilingual SRT files (Target Language + Original) for learning and verification.
 -   **VAD Support**: Built-in Voice Activity Detection to filter silence and noise.
@@ -33,6 +33,10 @@ A powerful tool to automatically download, transcribe, and translate YouTube vid
     ```bash
     pip install -r requirements.txt
     ```
+    This installs the core downloader/OpenAI packages plus the local Typhoon Whisper runtime.
+
+3.  **GPU note for local Typhoon ASR**:
+    `requirements.txt` includes `torch` for [`typhoon-ai/typhoon-whisper-large-v3`](https://huggingface.co/typhoon-ai/typhoon-whisper-large-v3). If you need a specific CUDA build, install the PyTorch wheel that matches your GPU/driver after installing the requirements.
 
 ## Configuration
 
@@ -62,7 +66,9 @@ export GOOGLE_API_KEY="your-google-key" # Optional
 2.  **Using the GUI**:
     -   **YouTube URL**: Paste the video link.
     -   **Settings**: Select Source/Target languages and Model (e.g., `gpt-4o`).
-    -   **Engine**: Choose `Whisper` (recommended) or `Google`.
+    -   **Engine**: Choose `Whisper`, `Google`, `Typhoon`, or `gpt-4o-transcribe-diarize`.
+    -   **Typhoon**: Select `Typhoon` to use the local Typhoon Whisper Large v3 model for transcription.
+    -   **GPT-4o Diarize**: Select `gpt-4o-transcribe-diarize` to use OpenAI's newer diarized transcription model. The Whisper prompt field is ignored for this model.
     -   **Start Processing**: Click to begin. The logs will show progress.
 
 ## Output

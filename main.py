@@ -74,7 +74,12 @@ class App:
         engine_frame = ttk.Frame(tab)
         engine_frame.pack(pady=2)
         ttk.Label(engine_frame, text="Engine:").pack(side='left', padx=5)
-        self.engine_combo = ttk.Combobox(engine_frame, values=["Whisper", "Google"], width=10, state='readonly')
+        self.engine_combo = ttk.Combobox(
+            engine_frame,
+            values=["Whisper", "Google", "Typhoon", "gpt-4o-transcribe-diarize"],
+            width=28,
+            state='readonly'
+        )
         self.engine_combo.set("Whisper")
         self.engine_combo.pack(side='left', padx=5)
 

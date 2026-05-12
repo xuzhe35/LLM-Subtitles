@@ -1,6 +1,9 @@
 import re
 import os
 
+DEFAULT_MAX_LINE_CHARS = 32
+_BREAK_AFTER_CHARS = set("，。！？；：、,.!?;:")
+
 def format_timestamp(seconds):
     """
     Converts seconds to SRT timestamp format (00:00:00,000).
@@ -79,7 +82,67 @@ def _vtt_time_to_seconds(time_str):
         seconds += float(parts[1])
     return seconds
 
-def generate_srt(segments, output_path):
+def wrap_subtitle_text(text, max_line_chars=DEFAULT_MAX_LINE_CHARS):
+    """
+    Inserts line breaks inside a subtitle cue without changing cue timing or count.
+    """
+    if text is None:
+        return ""
+
+    if not max_line_chars or max_line_chars <= 0:
+        return str(text).strip()
+
+    normalized = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    wrapped_lines = []
+
+    for raw_line in normalized.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            wrapped_lines.append("")
+            continue
+
+        wrapped_lines.extend(_wrap_single_subtitle_line(line, max_line_chars))
+
+    return "\n".join(wrapped_lines).strip()
+
+def _wrap_single_subtitle_line(line, max_line_chars):
+    lines = []
+    remaining = line
+
+    while len(remaining) > max_line_chars:
+        break_at = _choose_subtitle_break(remaining, max_line_chars)
+        chunk = remaining[:break_at].strip()
+        if chunk:
+            lines.append(chunk)
+        remaining = remaining[break_at:].lstrip()
+
+    if remaining.strip():
+        lines.append(remaining.strip())
+
+    return lines
+
+def _choose_subtitle_break(text, max_line_chars):
+    if len(text) <= max_line_chars:
+        return len(text)
+
+    # Keep punctuation with the previous line when it sits just after the limit.
+    if len(text) > max_line_chars and text[max_line_chars] in _BREAK_AFTER_CHARS:
+        return max_line_chars + 1
+
+    min_preferred = max(1, int(max_line_chars * 0.55))
+    search_end = min(len(text), max_line_chars + 1)
+
+    for i in range(search_end - 1, min_preferred - 1, -1):
+        if text[i] in _BREAK_AFTER_CHARS:
+            return i + 1
+
+    for i in range(search_end - 1, min_preferred - 1, -1):
+        if text[i].isspace():
+            return i
+
+    return max_line_chars
+
+def generate_srt(segments, output_path, max_line_chars=DEFAULT_MAX_LINE_CHARS):
     """
     Generates an SRT file from a list of segments.
     Segments should have 'start', 'end', and 'text'.
@@ -89,6 +152,7 @@ def generate_srt(segments, output_path):
             start = format_timestamp(segment['start'])
             end = format_timestamp(segment['end'])
             text = segment.get('text', '').strip()
+            text = wrap_subtitle_text(text, max_line_chars=max_line_chars)
             
             f.write(f"{i+1}\n")
             f.write(f"{start} --> {end}\n")
@@ -96,7 +160,7 @@ def generate_srt(segments, output_path):
     
     return output_path
 
-def generate_bilingual_srt(original_segments, translated_segments, output_path):
+def generate_bilingual_srt(original_segments, translated_segments, output_path, max_line_chars=DEFAULT_MAX_LINE_CHARS):
     """
     Generates a bilingual SRT file.
     Assumes segments align roughly by index or timestamp.
@@ -137,9 +201,9 @@ def generate_bilingual_srt(original_segments, translated_segments, output_path):
             # Style: Translated on top (Target), Original below.
             texts_to_combine = []
             if trans_text.strip():
-                texts_to_combine.append(trans_text.strip())
+                texts_to_combine.append(wrap_subtitle_text(trans_text.strip(), max_line_chars=max_line_chars))
             if orig_text.strip():
-                texts_to_combine.append(orig_text.strip())
+                texts_to_combine.append(wrap_subtitle_text(orig_text.strip(), max_line_chars=max_line_chars))
                 
             combined_text = "\n".join(texts_to_combine)
             

@@ -1,3 +1,10 @@
 yt-dlp
 openai
 requests
+
+# Local Typhoon Whisper ASR runtime
+torch
+transformers
+accelerate
+huggingface_hub
+safetensors

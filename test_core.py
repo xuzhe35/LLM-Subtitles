@@ -28,6 +28,37 @@ class TestCore(unittest.TestCase):
         
         os.remove(output_path)
 
+    def test_wrap_subtitle_text_keeps_single_segment_with_internal_line_breaks(self):
+        text = "明显白没有故意侵犯的意图，但是我们自己担心是否做错。"
+
+        wrapped = subtitle_formatter.wrap_subtitle_text(text, max_line_chars=12)
+
+        lines = wrapped.split("\n")
+        self.assertGreater(len(lines), 1)
+        self.assertEqual("".join(lines), text)
+        self.assertTrue(all(len(line) <= 13 for line in lines))
+        self.assertTrue(all(not line.startswith(("，", "。")) for line in lines))
+
+    def test_generate_srt_wraps_long_translation_without_splitting_cues(self):
+        segments = [
+            {
+                'start': 0,
+                'end': 2,
+                'text': "明显白没有故意侵犯的意图，但是我们自己担心是否做错。"
+            }
+        ]
+        output_path = "test_wrapped_output.srt"
+        subtitle_formatter.generate_srt(segments, output_path, max_line_chars=12)
+
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                content = f.read().replace('\r\n', '\n')
+        finally:
+            os.remove(output_path)
+
+        self.assertEqual(content.count("00:00:00,000 --> 00:00:02,000"), 1)
+        self.assertIn("明显白没有故意侵犯的意图，\n但是我们自己担心是否做错。", content)
+
     def test_translator_mock(self):
         mock_client = MagicMock()
         mock_response = MagicMock()

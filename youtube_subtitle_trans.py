@@ -185,20 +185,26 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
                  progress_callback("Error: Audio download failed.")
                  return
 
-        progress_callback(f"Transcribing audio ({engine})...")
-        google_api_key = get_config_value(
-            config,
-            env_keys=["GOOGLE_API_KEY"],
-            config_keys=["google_api_key", "Google API Key"]
-        )
-        if engine == 'google' and not google_api_key:
-             progress_callback("Error: Google engine requires GOOGLE_API_KEY or config.json google_api_key.")
-             return
+        transcription_model = transcriber.resolve_transcription_model(engine, source_lang)
+        progress_callback(f"Resolved transcription model: {transcription_model}")
+        progress_callback(f"Transcribing audio ({transcription_model})...")
+
+        google_api_key = None
+        if transcription_model == transcriber.TRANSCRIPTION_MODEL_GOOGLE:
+            google_api_key = get_config_value(
+                config,
+                env_keys=["GOOGLE_API_KEY"],
+                config_keys=["google_api_key", "Google API Key"]
+            )
+            if not google_api_key:
+                 progress_callback("Error: Google engine requires GOOGLE_API_KEY or config.json google_api_key.")
+                 return
 
         transcript = transcriber.transcribe_audio(
             client, audio_path, source_lang=source_lang, use_vad=use_vad, 
             whisper_prompt=whisper_prompt, max_segment_sec=max_segment_sec,
-            engine=engine, google_api_key=google_api_key
+            engine=engine, google_api_key=google_api_key,
+            transcription_model=transcription_model, progress_callback=progress_callback
         )
         if not transcript:
              progress_callback("Error: Transcription failed.")
@@ -250,7 +256,7 @@ def main():
     parser.add_argument("--use-vad", action="store_true", help="Enable Voice Activity Detection to filter silence/noise")
     parser.add_argument("--whisper-prompt", help="Prompt to guide Whisper transcription", default=None)
     parser.add_argument("--max-segment-sec", type=int, help="Max segment duration in seconds (default: 600)", default=None)
-    parser.add_argument("--engine", help="Transcription engine: 'whisper' or 'google'", default='whisper')
+    parser.add_argument("--engine", help="Transcription engine/model: 'whisper', 'google', 'typhoon', 'gpt-4o-transcribe-diarize', or 'auto'", default='whisper')
     args = parser.parse_args()
     
     process_video(

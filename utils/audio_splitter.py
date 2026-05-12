@@ -2,6 +2,7 @@ import os
 import subprocess
 import math
 import shutil
+import time
 
 def get_audio_duration(file_path):
     """
@@ -29,9 +30,11 @@ def split_audio(file_path, chunk_size_mb=24):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
+    split_started = time.perf_counter()
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     
     if file_size_mb <= chunk_size_mb:
+        print(f"Audio split skipped: {file_path} is {file_size_mb:.2f}MB (<= {chunk_size_mb}MB).")
         return [file_path]
 
     duration = get_audio_duration(file_path)
@@ -61,6 +64,7 @@ def split_audio(file_path, chunk_size_mb=24):
     print(f"Splitting {file_path} ({file_size_mb:.2f}MB, {duration:.2f}s) into {safe_num_chunks} chunks of ~{safe_chunk_duration:.2f}s each.")
 
     for i in range(safe_num_chunks):
+        chunk_started = time.perf_counter()
         start_time = i * safe_chunk_duration
         output_file = f"{base_name}_part{i}.m4a"
         
@@ -103,9 +107,11 @@ def split_audio(file_path, chunk_size_mb=24):
         try:
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             chunk_files.append(output_file)
+            print(f"  Split chunk {i+1}/{safe_num_chunks} finished in {time.perf_counter() - chunk_started:.1f}s: {output_file}")
         except subprocess.CalledProcessError as e:
             print(f"Error splitting chunk {i}: {e}")
             # If copy fails, maybe try re-encoding (implementation detail omitted for now)
             raise e
 
+    print(f"Audio splitting finished in {time.perf_counter() - split_started:.1f}s.")
     return chunk_files
