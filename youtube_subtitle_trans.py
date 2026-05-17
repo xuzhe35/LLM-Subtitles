@@ -28,6 +28,37 @@ def get_config_value(config, env_keys, config_keys=None, default=None):
 
     return default
 
+# The OpenAI SDK's default request timeout is 600s (10 min). That works fine
+# for short whisper-1 chunks, but gpt-4o-transcribe-diarize regularly takes
+# longer on multi-minute audio because diarization runs on top of the ASR
+# pass. A single ReadTimeout aborts the whole job (combined with the SDK's
+# default `max_retries=2`, we previously *disabled* retries entirely, so any
+# transient hiccup also killed the run). We pin both knobs here:
+#
+#   - timeout = 30 min   → covers diarize on chunks up to ~5–10 min audio.
+#                          Pair with utils.transcriber.DEFAULT_DIARIZE_MAX_SEGMENT_MS
+#                          which keeps each chunk well below this ceiling.
+#   - max_retries = 3    → SDK does exponential backoff on ReadTimeout / 5xx /
+#                          429. Three attempts is enough to ride out the
+#                          typical transient.
+OPENAI_REQUEST_TIMEOUT_SEC = 30 * 60  # 30 minutes
+OPENAI_MAX_RETRIES = 3
+
+
+def _build_openai_client(api_key):
+    """
+    Construct the OpenAI SDK client used for transcription + translation.
+
+    Pulled out into its own helper so the timeout/retry policy is testable
+    without having to mock the rest of process_video().
+    """
+    return OpenAI(
+        api_key=api_key,
+        timeout=float(OPENAI_REQUEST_TIMEOUT_SEC),
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+
+
 def ensure_dirs(base_path):
     dirs = {
         'original': os.path.join(base_path, 'original'),
@@ -54,7 +85,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
         progress_callback("Error: Missing OpenAI API key. Set OPENAI_API_KEY or config.json openai_api_key.")
         return
 
-    client = OpenAI(api_key=api_key, max_retries=0)
+    client = _build_openai_client(api_key)
     target_lang = lang if lang else get_config_value(
         config,
         env_keys=["DEFAULT_TARGET_LANGUAGE"],

@@ -9,6 +9,15 @@ from . import audio_splitter
 # 10 min works well for English. For challenging languages (Thai etc.), use 60-90s.
 DEFAULT_MAX_SEGMENT_MS = 10 * 60 * 1000  # 10 minutes
 
+# Default max duration per gpt-4o-transcribe-diarize API call (in ms).
+# The diarize endpoint is meaningfully slower than plain transcribe (it does
+# speaker labeling on top of ASR), and a single long upload + server-side
+# auto-chunking response can blow past the OpenAI SDK's request timeout on
+# 20+ minute audio. We force short local chunks so workers can parallelize
+# and each individual HTTPS request stays well under the timeout ceiling
+# (see OPENAI_REQUEST_TIMEOUT_SEC in youtube_subtitle_trans.py).
+DEFAULT_DIARIZE_MAX_SEGMENT_MS = 5 * 60 * 1000  # 5 minutes
+
 # Google API Key limit: Must be < 60 seconds for direct upload (no GCS)
 GOOGLE_API_MAX_SEGMENT_MS = 59 * 1000  # 59 seconds
 
@@ -700,10 +709,33 @@ def transcribe_audio(
             # Whisper uses 'th', Google uses 'th-TH'
             lang_map = {'th': 'th-TH', 'en': 'en-US', 'ja': 'ja-JP', 'zh': 'zh-CN'}
             google_lang = lang_map.get(source_lang, 'en-US') if source_lang else 'en-US'
+        elif use_openai_diarize:
+            # Diarize MUST chunk locally - without this, the fallback path
+            # streamed the entire file to _transcribe_diarize_file in one
+            # request, which routinely exceeded the OpenAI SDK request timeout
+            # on >15 min audio. Honor the user's max_segment_sec if they set
+            # one; otherwise default to DEFAULT_DIARIZE_MAX_SEGMENT_MS.
+            max_segment_ms = (
+                int(max_segment_sec * 1000) if max_segment_sec
+                else DEFAULT_DIARIZE_MAX_SEGMENT_MS
+            )
+            print(
+                f"Engine: gpt-4o-transcribe-diarize. Forcing local chunking at "
+                f"{max_segment_ms/1000:.0f}s per chunk to keep each API request "
+                "bounded."
+            )
         else:
             max_segment_ms = int(max_segment_sec * 1000) if max_segment_sec else DEFAULT_MAX_SEGMENT_MS
-        
-        use_custom_chunking = (max_segment_sec is not None) or (engine == 'google')  # Google MUST chunk
+
+        # Local chunking is required for:
+        #   - explicit user choice (max_segment_sec)
+        #   - Google (API limit < 60s)
+        #   - diarize (request-timeout protection; see comment above)
+        use_custom_chunking = (
+            (max_segment_sec is not None)
+            or (engine == 'google')
+            or use_openai_diarize
+        )
         
         speech_segments = []
         
