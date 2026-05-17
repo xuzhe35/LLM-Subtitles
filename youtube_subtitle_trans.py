@@ -1,15 +1,121 @@
 import argparse
 import json
 import os
+import re
 from openai import OpenAI
 from utils import downloader, transcriber, translator, subtitle_formatter
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+
+# Characters that are unsafe in filenames on common filesystems (Windows is the strictest).
+_FS_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_MAX_FILENAME_LEN = 100
+
+# Strings commonly found in unfilled config templates / placeholders.
+_API_KEY_PLACEHOLDER_MARKERS = (
+    "YOUR_OPENAI_API_KEY",
+    "YOUR_API_KEY",
+    "YOUR-KEY",
+    "REPLACE_ME",
+    "<YOUR_KEY>",
+    "EXAMPLE",
+)
+
+
+def validate_openai_api_key(api_key):
+    """
+    Validate an OpenAI API key value pulled from config or env.
+
+    Returns (is_valid, normalized_key_or_None, reason).
+    - Strips surrounding whitespace and stray quotes (a common config.json mistake).
+    - Rejects empty / placeholder values with a specific reason.
+    - Warns (but does not reject) keys missing the standard 'sk-' prefix so
+      self-hosted proxies and Azure-style endpoints still work.
+    """
+    if api_key is None:
+        return False, None, (
+            "Missing OpenAI API key. Set OPENAI_API_KEY or add 'openai_api_key' to config.json."
+        )
+
+    key = str(api_key).strip().strip("'\"")
+    if not key:
+        return False, None, "OpenAI API key is empty after trimming whitespace/quotes."
+
+    upper = key.upper()
+    for marker in _API_KEY_PLACEHOLDER_MARKERS:
+        if marker in upper:
+            return False, None, (
+                f"OpenAI API key looks like an unfilled placeholder ({marker!r}). "
+                "Replace it with a real key in config.json or OPENAI_API_KEY."
+            )
+
+    # Deliberately not enforcing a minimum length / sk- prefix here: self-hosted
+    # proxies and Azure deployments can ship keys in arbitrary formats. We let
+    # the actual API call surface "invalid_api_key" errors for those cases.
+    return True, key, None
+
+
+def sanitize_filename(title, fallback="video"):
+    """
+    Produce a filesystem-safe filename from a (possibly Unicode) title.
+
+    - Unicode letters/digits (CJK, Cyrillic, etc.) are preserved.
+    - Path-unsafe characters (<>:"/\\|?*, control chars) are replaced with '_'.
+    - Leading/trailing whitespace, dots and underscores are stripped (Windows
+      forbids trailing dots/spaces in file names).
+    - If the result is empty, returns `fallback`.
+    - Length is capped to avoid hitting filesystem limits.
+    """
+    if not title:
+        return fallback
+
+    # Normalize whitespace, then replace unsafe characters.
+    cleaned = _FS_UNSAFE_CHARS.sub("_", str(title))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # Drop leading/trailing dots, spaces and underscores.
+    cleaned = cleaned.strip(" ._")
+
+    if not cleaned:
+        return fallback
+
+    # Require at least one alphanumeric character. This rejects titles that
+    # are entirely emoji or punctuation (e.g. "!?!?", "😀🎉"), which would
+    # otherwise produce filenames that are technically valid but unreadable
+    # and prone to overwriting each other across runs.
+    if not any(c.isalnum() for c in cleaned):
+        return fallback
+
+    if len(cleaned) > _MAX_FILENAME_LEN:
+        cleaned = cleaned[:_MAX_FILENAME_LEN].rstrip(" ._")
+        if not cleaned or not any(c.isalnum() for c in cleaned):
+            return fallback
+
+    return cleaned
+
 def load_config():
-    config_path = "config.json"
+    config_path = os.path.join(PROJECT_ROOT, "config.json")
     if not os.path.exists(config_path):
         return {}
     with open(config_path, "r") as f:
         return json.load(f)
+
+def resolve_output_dir(config, explicit=None):
+    """
+    Resolve the output directory. Priority: explicit arg > env > config > default.
+    Relative paths are resolved against PROJECT_ROOT, not CWD, so the location
+    is stable regardless of how the app is launched.
+    """
+    candidate = explicit or get_config_value(
+        config,
+        env_keys=["LLM_SUBTITLES_OUTPUT_DIR"],
+        config_keys=["output_dir"],
+        default=DEFAULT_OUTPUT_DIR,
+    )
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(PROJECT_ROOT, candidate)
+    return os.path.abspath(candidate)
 
 def get_config_value(config, env_keys, config_keys=None, default=None):
     """
@@ -37,7 +143,7 @@ def ensure_dirs(base_path):
         os.makedirs(d, exist_ok=True)
     return dirs
 
-def process_video(url, lang=None, model=None, force_audio=False, source_lang=None, use_vad=False, whisper_prompt=None, max_segment_sec=None, engine='whisper', progress_callback=print, download_progress_callback=None):
+def process_video(url, lang=None, model=None, force_audio=False, source_lang=None, use_vad=False, whisper_prompt=None, max_segment_sec=None, engine='whisper', progress_callback=print, download_progress_callback=None, output_dir=None):
     """
     Main processing logic, callable by UI.
     progress_callback: function to receive log strings.
@@ -45,14 +151,20 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
     """
     config = load_config()
 
-    api_key = get_config_value(
+    raw_api_key = get_config_value(
         config,
         env_keys=["OPENAI_API_KEY"],
         config_keys=["openai_api_key"]
     )
-    if not api_key or "YOUR_OPENAI_API_KEY" in api_key:
-        progress_callback("Error: Missing OpenAI API key. Set OPENAI_API_KEY or config.json openai_api_key.")
+    is_valid, api_key, reason = validate_openai_api_key(raw_api_key)
+    if not is_valid:
+        progress_callback(f"Error: {reason}")
         return
+    if not api_key.startswith("sk-"):
+        progress_callback(
+            f"Warning: OpenAI API key does not start with 'sk-' (got prefix {api_key[:4]!r}). "
+            "Proceeding anyway — this is OK for self-hosted proxies / Azure endpoints."
+        )
 
     client = OpenAI(api_key=api_key, max_retries=0)
     target_lang = lang if lang else get_config_value(
@@ -69,9 +181,10 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
     )
 
     progress_callback(f"Processing URL: {url} | Target: {target_lang}")
-    
+
     # Setup Output Directories
-    output_root = "output"
+    output_root = resolve_output_dir(config, explicit=output_dir)
+    progress_callback(f"Output directory: {output_root}")
     dirs = ensure_dirs(output_root)
     
     # 1. Get Video Info
@@ -82,7 +195,12 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
         return
 
     video_title = info.get('title', 'video')
-    safe_title = "".join([c for c in video_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+    # Fall back to the video id (yt-dlp always provides it) so non-ASCII or
+    # punctuation-only titles never collapse to an empty filename.
+    fallback_name = info.get('id') or 'video'
+    safe_title = sanitize_filename(video_title, fallback=fallback_name)
+    if safe_title != video_title:
+        progress_callback(f"Sanitized title for filenames: {safe_title!r} (from {video_title!r})")
     
     # Variables to track
     original_segments = []
@@ -241,7 +359,7 @@ def process_video(url, lang=None, model=None, force_audio=False, source_lang=Non
     
     # 2. Bilingual SRT
     bilingual_path = os.path.join(dirs['translated'], f"{safe_title}.{target_lang}.bilingual.srt")
-    subtitle_formatter.generate_bilingual_srt(original_segments, translated_segments, bilingual_path)
+    subtitle_formatter.generate_bilingual_srt(original_segments, translated_segments, bilingual_path, progress_callback=progress_callback)
     progress_callback(f"Bilingual SRT saved: {bilingual_path}")
     
     progress_callback("Done!")
@@ -257,13 +375,14 @@ def main():
     parser.add_argument("--whisper-prompt", help="Prompt to guide Whisper transcription", default=None)
     parser.add_argument("--max-segment-sec", type=int, help="Max segment duration in seconds (default: 600)", default=None)
     parser.add_argument("--engine", help="Transcription engine/model: 'whisper', 'google', 'typhoon', 'gpt-4o-transcribe-diarize', or 'auto'", default='whisper')
+    parser.add_argument("--output-dir", help="Output directory (overrides config). Relative paths resolve against the project root.", default=None)
     args = parser.parse_args()
-    
+
     process_video(
-        args.url, args.lang, args.model, args.force_audio, 
-        source_lang=args.source_lang, use_vad=args.use_vad, 
+        args.url, args.lang, args.model, args.force_audio,
+        source_lang=args.source_lang, use_vad=args.use_vad,
         whisper_prompt=args.whisper_prompt, max_segment_sec=args.max_segment_sec,
-        engine=args.engine
+        engine=args.engine, output_dir=args.output_dir
     )
 
 if __name__ == "__main__":

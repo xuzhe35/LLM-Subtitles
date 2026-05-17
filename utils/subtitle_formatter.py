@@ -160,57 +160,82 @@ def generate_srt(segments, output_path, max_line_chars=DEFAULT_MAX_LINE_CHARS):
     
     return output_path
 
-def generate_bilingual_srt(original_segments, translated_segments, output_path, max_line_chars=DEFAULT_MAX_LINE_CHARS):
+def _segment_timing(segment):
+    """Return (start, end) from a segment dict, or None if either is missing/None."""
+    if not segment:
+        return None
+    start = segment.get('start')
+    end = segment.get('end')
+    if start is None or end is None:
+        return None
+    return start, end
+
+
+def generate_bilingual_srt(original_segments, translated_segments, output_path, max_line_chars=DEFAULT_MAX_LINE_CHARS, progress_callback=None):
     """
     Generates a bilingual SRT file.
-    Assumes segments align roughly by index or timestamp.
-    If lengths differ, it tries to align by index (simplest for 1:1 translation).
-    Effect:
-    Translated Text
-    Original Text
-    """
-    with open(output_path, 'w', encoding='utf-8') as f:
-        # Use translated segments as the base for timing if available, or original.
-        # Usually original has better timing if translated was just text list.
-        # But here our translator preserves dict structure.
-        
-        count = max(len(original_segments), len(translated_segments))
-        
-        for i in range(count):
-            # Get translated text
-            trans_text = ""
-            if i < len(translated_segments):
-                trans_text = translated_segments[i]['text']
-                # Use translated timing? Or original?
-                start = format_timestamp(translated_segments[i]['start'])
-                end = format_timestamp(translated_segments[i]['end'])
-            else:
-                 # Fallback timing
-                 start = "00:00:00,000" 
-                 end = "00:00:00,000"
+    Aligns by index (the translator preserves 1:1 ordering with the originals).
 
-            # Get original text
-            orig_text = ""
-            if i < len(original_segments):
-                orig_text = original_segments[i]['text']
-                # If we rely on original timing (often safer)
-                start = format_timestamp(original_segments[i]['start'])
-                end = format_timestamp(original_segments[i]['end'])
-            
-            # Combine
-            # Style: Translated on top (Target), Original below.
+    Timing precedence: original segment timing wins when present (it comes from
+    the audio/source subtitles and is the most reliable); otherwise translated
+    timing is used. Entries that have no valid timing on either side are
+    skipped with a warning rather than emitted with a placeholder 00:00:00,000
+    timestamp (which previously collapsed orphan entries to the start of the
+    video and silently corrupted the output).
+
+    Style: Translated on top (target language), Original below.
+    """
+    orig_len = len(original_segments)
+    trans_len = len(translated_segments)
+    count = max(orig_len, trans_len)
+
+    if orig_len != trans_len and progress_callback is not None:
+        progress_callback(
+            f"Warning: bilingual SRT segment count mismatch "
+            f"(original={orig_len}, translated={trans_len}). "
+            "Entries without matching timing will be skipped."
+        )
+
+    skipped = 0
+    written = 0
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for i in range(count):
+            orig_seg = original_segments[i] if i < orig_len else None
+            trans_seg = translated_segments[i] if i < trans_len else None
+
+            # Pick timing: prefer original, fall back to translated.
+            timing = _segment_timing(orig_seg) or _segment_timing(trans_seg)
+            if timing is None:
+                skipped += 1
+                continue
+
+            start, end = timing
+
+            orig_text = (orig_seg.get('text') if orig_seg else '') or ''
+            trans_text = (trans_seg.get('text') if trans_seg else '') or ''
+
             texts_to_combine = []
             if trans_text.strip():
                 texts_to_combine.append(wrap_subtitle_text(trans_text.strip(), max_line_chars=max_line_chars))
             if orig_text.strip():
                 texts_to_combine.append(wrap_subtitle_text(orig_text.strip(), max_line_chars=max_line_chars))
-                
+
+            if not texts_to_combine:
+                # Timing exists but both texts are empty — nothing meaningful to show.
+                skipped += 1
+                continue
+
             combined_text = "\n".join(texts_to_combine)
-            
-            f.write(f"{i+1}\n")
-            f.write(f"{start} --> {end}\n")
+            written += 1
+
+            f.write(f"{written}\n")
+            f.write(f"{format_timestamp(start)} --> {format_timestamp(end)}\n")
             f.write(f"{combined_text}\n\n")
-    
+
+    if skipped and progress_callback is not None:
+        progress_callback(f"Bilingual SRT: skipped {skipped} entry/entries with no valid timing or text.")
+
     return output_path
 
 def parse_srt(srt_file_path):

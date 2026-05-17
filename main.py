@@ -103,6 +103,15 @@ class App:
         self.whisper_prompt_entry.insert(0, "")
         self.whisper_prompt_entry.pack(side='left', fill='x', expand=True)
 
+        # Output Directory
+        output_frame = ttk.Frame(tab)
+        output_frame.pack(fill='x', padx=5, pady=2)
+        ttk.Label(output_frame, text="Output Dir:").pack(side='left', padx=(0,5))
+        self.output_dir_entry = ttk.Entry(output_frame, width=50)
+        self.output_dir_entry.insert(0, youtube_subtitle_trans.DEFAULT_OUTPUT_DIR)
+        self.output_dir_entry.pack(side='left', fill='x', expand=True)
+        ttk.Button(output_frame, text="Browse", command=self.browse_output_dir).pack(side='right', padx=(5, 0))
+
         # Button
         self.start_btn = ttk.Button(tab, text="Start Processing", command=self.start_processing)
         self.start_btn.pack(pady=10)
@@ -155,6 +164,13 @@ class App:
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, filename)
 
+    def browse_output_dir(self):
+        current = self.output_dir_entry.get() or youtube_subtitle_trans.DEFAULT_OUTPUT_DIR
+        dirname = filedialog.askdirectory(initialdir=current)
+        if dirname:
+            self.output_dir_entry.delete(0, tk.END)
+            self.output_dir_entry.insert(0, dirname)
+
     def update_progress_bar(self, percent_str):
         # percent_str is something like "45.0%"
         try:
@@ -181,7 +197,8 @@ class App:
         chunk_size_name = self.chunk_size_combo.get()
         max_segment_sec = self.chunk_size_options.get(chunk_size_name)
         engine = self.engine_combo.get().lower()
-        
+        output_dir = self.output_dir_entry.get().strip() or None
+
         if not url:
             self.log("Please enter a URL.")
             return
@@ -194,11 +211,12 @@ class App:
         def run():
             try:
                 youtube_subtitle_trans.process_video(
-                    url, lang, model, force_audio=force_audio, 
-                    source_lang=source_lang, use_vad=use_vad, 
+                    url, lang, model, force_audio=force_audio,
+                    source_lang=source_lang, use_vad=use_vad,
                     whisper_prompt=whisper_prompt, max_segment_sec=max_segment_sec,
                     engine=engine, progress_callback=self.log,
-                    download_progress_callback=self.update_progress_bar
+                    download_progress_callback=self.update_progress_bar,
+                    output_dir=output_dir
                 )
             except Exception as e:
                 self.log(f"Error: {e}")
