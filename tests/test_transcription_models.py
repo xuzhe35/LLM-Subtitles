@@ -1,6 +1,9 @@
 import os
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -95,6 +98,93 @@ class TestTyphoonTranscription(unittest.TestCase):
             generate_kwargs={"language": "thai"},
         )
 
+    def test_pipeline_initialization_is_thread_safe(self):
+        """
+        Concurrent callers of `_get_typhoon_pipeline` must build the pipeline
+        exactly once — without the lock, two threads would each download the
+        multi-GB model and overwrite each other's `_TYPHOON_PIPELINE`.
+        """
+        N_THREADS = 8
+
+        # Reset the module-level cache so we exercise the init path.
+        transcriber._TYPHOON_PIPELINE = None
+
+        init_count = {"n": 0}
+        # Used to widen the race window: hold every thread at the start of
+        # init until they're all in flight.
+        all_threads_started = threading.Event()
+
+        def fake_pipeline_factory(*args, **kwargs):
+            init_count["n"] += 1
+            # Block until every worker is actively trying to init. Without the
+            # lock, all N would race through this and each call the factory.
+            all_threads_started.wait(timeout=2.0)
+            return SimpleNamespace(_id=init_count["n"])
+
+        fake_model = MagicMock()
+        fake_model.to.return_value = fake_model
+
+        fake_torch = types.SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False),
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
+            bfloat16="bfloat16",
+            float16="float16",
+            float32="float32",
+        )
+
+        fake_transformers = types.SimpleNamespace(
+            AutoModelForSpeechSeq2Seq=SimpleNamespace(from_pretrained=lambda *a, **kw: fake_model),
+            AutoProcessor=SimpleNamespace(from_pretrained=lambda *a, **kw: SimpleNamespace(
+                tokenizer=MagicMock(), feature_extractor=MagicMock()
+            )),
+            pipeline=fake_pipeline_factory,
+        )
+
+        results = [None] * N_THREADS
+        barrier = threading.Barrier(N_THREADS)
+
+        def worker(idx):
+            barrier.wait()  # release all threads at once
+            results[idx] = transcriber._get_typhoon_pipeline(progress_callback=lambda _msg: None)
+
+        try:
+            with patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(N_THREADS)]
+                for t in threads:
+                    t.start()
+                # Brief sleep so the first thread can reach `wait()` inside
+                # the factory; then release.
+                time.sleep(0.05)
+                all_threads_started.set()
+                for t in threads:
+                    t.join(timeout=5.0)
+                    self.assertFalse(t.is_alive(), "worker thread hung")
+        finally:
+            transcriber._TYPHOON_PIPELINE = None
+
+        # Exactly one initialization — the whole point of the lock.
+        self.assertEqual(1, init_count["n"])
+        # Every caller observes the same pipeline instance.
+        self.assertTrue(all(r is results[0] for r in results))
+        self.assertIsNotNone(results[0])
+
+    def test_failed_init_allows_retry(self):
+        """
+        If pipeline construction raises, the global must stay None so the
+        next call can retry — not get stuck with a half-built object.
+        """
+        transcriber._TYPHOON_PIPELINE = None
+        try:
+            with patch.dict(sys.modules, {}, clear=False):
+                # Force ImportError on transformers to simulate missing deps.
+                sys.modules.pop("transformers", None)
+                with patch.dict(sys.modules, {"transformers": None}):
+                    with self.assertRaises((RuntimeError, ImportError)):
+                        transcriber._get_typhoon_pipeline(progress_callback=lambda _msg: None)
+            self.assertIsNone(transcriber._TYPHOON_PIPELINE)
+        finally:
+            transcriber._TYPHOON_PIPELINE = None
+
     def test_missing_typhoon_dependencies_return_clear_error_without_openai_call(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio_path = os.path.join(tmp_dir, "audio.wav")
@@ -120,6 +210,141 @@ class TestTyphoonTranscription(unittest.TestCase):
         self.assertIsNone(result)
         self.assertFalse(client.audio.transcriptions.create.called)
         self.assertTrue(any("transformers accelerate huggingface_hub" in msg for msg in logs))
+
+
+class TestTempFileCleanup(unittest.TestCase):
+    """
+    Workers extract per-segment audio chunks to disk. These must be cleaned up
+    on success, on transcription failure, and even when the worker itself raises
+    an unexpected exception — otherwise long runs leak files into the user's
+    output directory.
+    """
+
+    def _fake_extract(self, chunk_path, *_args, **_kwargs):
+        # Pretend ffmpeg ran: write a stub file at chunk_path.
+        os.makedirs(os.path.dirname(chunk_path), exist_ok=True)
+        with open(chunk_path, "wb") as f:
+            f.write(b"fake chunk")
+        return True
+
+    def test_whisper_worker_removes_chunk_on_success(self):
+        with tempfile.TemporaryDirectory() as work_dir, tempfile.TemporaryDirectory() as src_dir:
+            audio_path = os.path.join(src_dir, "audio.m4a")
+            open(audio_path, "wb").close()
+
+            client = MagicMock()
+            client.audio.transcriptions.create.return_value = SimpleNamespace(
+                segments=[SimpleNamespace(start=0.0, end=1.0, text="hi")]
+            )
+
+            with patch.object(transcriber, "_extract_segment",
+                              side_effect=lambda audio, s, e, out: self._fake_extract(out)):
+                idx, segs = transcriber._transcribe_single_segment(
+                    client, audio_path, 0, 0, 1000, work_dir=work_dir,
+                )
+
+            self.assertEqual(idx, 0)
+            self.assertEqual(len(segs), 1)
+            # Chunk file must be gone.
+            self.assertEqual(os.listdir(work_dir), [])
+
+    def test_whisper_worker_removes_chunk_on_api_exception(self):
+        with tempfile.TemporaryDirectory() as work_dir, tempfile.TemporaryDirectory() as src_dir:
+            audio_path = os.path.join(src_dir, "audio.m4a")
+            open(audio_path, "wb").close()
+
+            client = MagicMock()
+            client.audio.transcriptions.create.side_effect = RuntimeError("rate limit")
+
+            with patch.object(transcriber, "_extract_segment",
+                              side_effect=lambda audio, s, e, out: self._fake_extract(out)):
+                idx, segs = transcriber._transcribe_single_segment(
+                    client, audio_path, 3, 0, 1000, work_dir=work_dir,
+                )
+
+            self.assertEqual(idx, 3)
+            self.assertEqual(segs, [])
+            self.assertEqual(os.listdir(work_dir), [],
+                             "chunk file must be removed even when the API call raises")
+
+    def test_whisper_worker_removes_partial_chunk_when_extract_returns_false(self):
+        """
+        If _extract_segment returns False but ffmpeg already wrote a partial
+        file (e.g. it was killed midway), the chunk must still be cleaned —
+        previously the early return skipped cleanup.
+        """
+        with tempfile.TemporaryDirectory() as work_dir, tempfile.TemporaryDirectory() as src_dir:
+            audio_path = os.path.join(src_dir, "audio.m4a")
+            open(audio_path, "wb").close()
+
+            def partial_extract(audio, s, e, out):
+                # Write a partial file, then claim extraction failed.
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with open(out, "wb") as f:
+                    f.write(b"partial")
+                return False
+
+            client = MagicMock()
+            with patch.object(transcriber, "_extract_segment", side_effect=partial_extract):
+                idx, segs = transcriber._transcribe_single_segment(
+                    client, audio_path, 7, 0, 1000, work_dir=work_dir,
+                )
+
+            self.assertEqual(idx, 7)
+            self.assertEqual(segs, [])
+            self.assertEqual(os.listdir(work_dir), [],
+                             "partial chunk file from failed extraction must be removed")
+
+    def test_diarize_worker_removes_chunk_on_exception(self):
+        with tempfile.TemporaryDirectory() as work_dir, tempfile.TemporaryDirectory() as src_dir:
+            audio_path = os.path.join(src_dir, "audio.m4a")
+            open(audio_path, "wb").close()
+
+            client = MagicMock()
+            client.audio.transcriptions.create.side_effect = RuntimeError("API down")
+
+            with patch.object(transcriber, "_extract_segment",
+                              side_effect=lambda audio, s, e, out: self._fake_extract(out)):
+                idx, segs = transcriber._transcribe_single_segment_diarize(
+                    client, audio_path, 0, 0, 1000, work_dir=work_dir,
+                )
+
+            self.assertEqual(segs, [])
+            self.assertEqual(os.listdir(work_dir), [])
+
+    def test_transcribe_audio_cleans_work_dir_on_unexpected_exception(self):
+        """
+        The top-level `try/finally` in transcribe_audio must wipe the scratch
+        dir even when an exception escapes the worker logic — e.g. when the
+        resolve_transcription_model call raises (unknown engine).
+        """
+        with tempfile.TemporaryDirectory() as src_dir:
+            audio_path = os.path.join(src_dir, "audio.m4a")
+            open(audio_path, "wb").close()
+
+            created_dirs = []
+            real_mkdtemp = tempfile.mkdtemp
+
+            def tracking_mkdtemp(*a, **kw):
+                d = real_mkdtemp(*a, **kw)
+                created_dirs.append(d)
+                # Drop a file into the work dir so we can later verify the dir
+                # (and its contents) is gone.
+                with open(os.path.join(d, "leak.txt"), "wb") as f:
+                    f.write(b"leak")
+                return d
+
+            with patch.object(transcriber.tempfile, "mkdtemp", side_effect=tracking_mkdtemp), \
+                 patch.object(transcriber, "resolve_transcription_model",
+                              side_effect=ValueError("boom")):
+                result = transcriber.transcribe_audio(
+                    MagicMock(), audio_path, progress_callback=lambda _m: None,
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(created_dirs), 1)
+        self.assertFalse(os.path.exists(created_dirs[0]),
+                         "scratch dir must be removed in the top-level finally")
 
 
 class TestOpenAIDiarizeTranscription(unittest.TestCase):
@@ -158,51 +383,77 @@ class TestOpenAIDiarizeTranscription(unittest.TestCase):
         self.assertTrue(any("Whisper Prompt ignored" in msg for msg in logs))
 
 
+class TestResolveOutputDir(unittest.TestCase):
+    def test_default_is_project_root_output(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LLM_SUBTITLES_OUTPUT_DIR", None)
+            result = youtube_subtitle_trans.resolve_output_dir({})
+        self.assertEqual(result, youtube_subtitle_trans.DEFAULT_OUTPUT_DIR)
+        self.assertTrue(os.path.isabs(result))
+
+    def test_explicit_absolute_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = youtube_subtitle_trans.resolve_output_dir({}, explicit=tmp_dir)
+        self.assertEqual(result, os.path.abspath(tmp_dir))
+
+    def test_explicit_relative_resolves_to_project_root(self):
+        result = youtube_subtitle_trans.resolve_output_dir({}, explicit="custom_out")
+        self.assertEqual(result, os.path.join(youtube_subtitle_trans.PROJECT_ROOT, "custom_out"))
+
+    def test_env_var_takes_precedence_over_config(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch.dict(os.environ, {"LLM_SUBTITLES_OUTPUT_DIR": tmp_dir}):
+            result = youtube_subtitle_trans.resolve_output_dir({"output_dir": "/should/not/be/used"})
+        self.assertEqual(result, os.path.abspath(tmp_dir))
+
+    def test_config_used_when_no_env_or_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.environ.pop("LLM_SUBTITLES_OUTPUT_DIR", None)
+            result = youtube_subtitle_trans.resolve_output_dir({"output_dir": tmp_dir})
+        self.assertEqual(result, os.path.abspath(tmp_dir))
+
+
 class TestProcessVideoTyphoonRouting(unittest.TestCase):
     def test_explicit_typhoon_route_does_not_require_google_api_key(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            old_cwd = os.getcwd()
-            os.chdir(tmp_dir)
-            try:
-                logs = []
-                transcribe_kwargs = {}
+            logs = []
+            transcribe_kwargs = {}
 
-                def fake_download_audio(url, output_path, progress_hook=None):
-                    path = output_path + ".mp3"
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "wb") as f:
-                        f.write(b"fake audio")
-                    return path
+            def fake_download_audio(url, output_path, progress_hook=None):
+                path = output_path + ".mp3"
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"fake audio")
+                return path
 
-                def fake_transcribe_audio(*args, **kwargs):
-                    transcribe_kwargs.update(kwargs)
+            def fake_transcribe_audio(*args, **kwargs):
+                transcribe_kwargs.update(kwargs)
 
-                    class TranscriptResult:
-                        segments = [
-                            {"start": 0.0, "end": 1.0, "text": "sawatdee"},
-                        ]
+                class TranscriptResult:
+                    segments = [
+                        {"start": 0.0, "end": 1.0, "text": "sawatdee"},
+                    ]
 
-                    return TranscriptResult()
+                return TranscriptResult()
 
-                with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
-                     patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
-                     patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "Thai Demo", "subtitles": {}}), \
-                     patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
-                     patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
-                     patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
-                         {"start": 0.0, "end": 1.0, "text": "hello"},
-                     ]):
-                    youtube_subtitle_trans.process_video(
-                        "https://example.com/video",
-                        lang="Simplified Chinese",
-                        model="gpt-4o",
-                        force_audio=True,
-                        source_lang="th",
-                        engine="typhoon",
-                        progress_callback=logs.append,
-                    )
-            finally:
-                os.chdir(old_cwd)
+            with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
+                 patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
+                 patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "Thai Demo", "subtitles": {}}), \
+                 patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
+                 patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
+                 patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
+                     {"start": 0.0, "end": 1.0, "text": "hello"},
+                 ]):
+                youtube_subtitle_trans.process_video(
+                    "https://example.com/video",
+                    lang="Simplified Chinese",
+                    model="gpt-4o",
+                    force_audio=True,
+                    source_lang="th",
+                    engine="typhoon",
+                    progress_callback=logs.append,
+                    output_dir=tmp_dir,
+                )
 
         self.assertEqual(
             transcriber.TRANSCRIPTION_MODEL_TYPHOON,
@@ -213,48 +464,44 @@ class TestProcessVideoTyphoonRouting(unittest.TestCase):
 
     def test_explicit_gpt4o_diarize_route_is_respected(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            old_cwd = os.getcwd()
-            os.chdir(tmp_dir)
-            try:
-                logs = []
-                transcribe_kwargs = {}
+            logs = []
+            transcribe_kwargs = {}
 
-                def fake_download_audio(url, output_path, progress_hook=None):
-                    path = output_path + ".mp3"
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "wb") as f:
-                        f.write(b"fake audio")
-                    return path
+            def fake_download_audio(url, output_path, progress_hook=None):
+                path = output_path + ".mp3"
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"fake audio")
+                return path
 
-                def fake_transcribe_audio(*args, **kwargs):
-                    transcribe_kwargs.update(kwargs)
+            def fake_transcribe_audio(*args, **kwargs):
+                transcribe_kwargs.update(kwargs)
 
-                    class TranscriptResult:
-                        segments = [
-                            {"start": 0.0, "end": 1.0, "text": "hello"},
-                        ]
+                class TranscriptResult:
+                    segments = [
+                        {"start": 0.0, "end": 1.0, "text": "hello"},
+                    ]
 
-                    return TranscriptResult()
+                return TranscriptResult()
 
-                with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
-                     patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
-                     patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "GPT Demo", "subtitles": {}}), \
-                     patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
-                     patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
-                     patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
-                         {"start": 0.0, "end": 1.0, "text": "ni hao"},
-                     ]):
-                    youtube_subtitle_trans.process_video(
-                        "https://example.com/video",
-                        lang="Simplified Chinese",
-                        model="gpt-4o",
-                        force_audio=True,
-                        source_lang="th",
-                        engine="gpt-4o-transcribe-diarize",
-                        progress_callback=logs.append,
-                    )
-            finally:
-                os.chdir(old_cwd)
+            with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
+                 patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
+                 patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "GPT Demo", "subtitles": {}}), \
+                 patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
+                 patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
+                 patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
+                     {"start": 0.0, "end": 1.0, "text": "ni hao"},
+                 ]):
+                youtube_subtitle_trans.process_video(
+                    "https://example.com/video",
+                    lang="Simplified Chinese",
+                    model="gpt-4o",
+                    force_audio=True,
+                    source_lang="th",
+                    engine="gpt-4o-transcribe-diarize",
+                    progress_callback=logs.append,
+                    output_dir=tmp_dir,
+                )
 
         self.assertEqual(
             transcriber.TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE,

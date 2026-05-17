@@ -3,6 +3,9 @@ from unittest.mock import MagicMock
 from utils import translator, subtitle_formatter
 import json
 import os
+import tempfile
+
+import youtube_subtitle_trans
 
 class TestCore(unittest.TestCase):
     def test_format_timestamp(self):
@@ -131,6 +134,215 @@ Line 2
         self.assertEqual(segments[0]['text'], "Line 1")
         
         os.remove("test.srt")
+
+class TestSanitizeFilename(unittest.TestCase):
+    def test_ascii_title_preserved(self):
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("Hello World 123"), "Hello World 123")
+
+    def test_cjk_title_preserved(self):
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("中文标题"), "中文标题")
+
+    def test_filesystem_unsafe_chars_replaced(self):
+        result = youtube_subtitle_trans.sanitize_filename('My/File:Name?')
+        self.assertNotIn('/', result)
+        self.assertNotIn(':', result)
+        self.assertNotIn('?', result)
+        self.assertIn('_', result)
+        self.assertTrue(result.startswith('My'))
+
+    def test_emoji_only_falls_back(self):
+        # Emoji are not alpha, leaving the cleaned string empty after stripping.
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("😀🎉", fallback="abc123"), "abc123")
+
+    def test_punctuation_only_falls_back(self):
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("!?!?", fallback="vid1"), "vid1")
+
+    def test_empty_input_falls_back(self):
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("", fallback="abc"), "abc")
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename(None, fallback="abc"), "abc")
+
+    def test_trailing_dots_and_spaces_stripped(self):
+        # Windows rejects trailing dots/spaces — make sure we strip them.
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("video..."), "video")
+        self.assertEqual(youtube_subtitle_trans.sanitize_filename("video   "), "video")
+
+    def test_length_capped(self):
+        result = youtube_subtitle_trans.sanitize_filename("a" * 500)
+        self.assertLessEqual(len(result), 100)
+
+    def test_control_chars_stripped(self):
+        result = youtube_subtitle_trans.sanitize_filename("hello\x00\x01world")
+        self.assertNotIn('\x00', result)
+        self.assertNotIn('\x01', result)
+        self.assertIn('hello', result)
+        self.assertIn('world', result)
+
+
+class TestGenerateBilingualSrt(unittest.TestCase):
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read().replace('\r\n', '\n')
+
+    def test_aligned_segments_use_original_timing(self):
+        original = [
+            {'start': 0.0, 'end': 2.0, 'text': "Hello"},
+            {'start': 2.5, 'end': 4.0, 'text': "World"},
+        ]
+        translated = [
+            {'start': 0.0, 'end': 2.0, 'text': "你好"},
+            {'start': 2.5, 'end': 4.0, 'text': "世界"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = os.path.join(tmp_dir, "out.srt")
+            subtitle_formatter.generate_bilingual_srt(original, translated, out)
+            content = self._read(out)
+
+        self.assertIn("00:00:00,000 --> 00:00:02,000", content)
+        self.assertIn("00:00:02,500 --> 00:00:04,000", content)
+        # Translated on top, original below.
+        self.assertIn("你好\nHello", content)
+        self.assertIn("世界\nWorld", content)
+        # Never emits the bogus zero-duration entry.
+        self.assertEqual(content.count("00:00:00,000 --> 00:00:00,000"), 0)
+
+    def test_translated_shorter_uses_original_timing(self):
+        original = [
+            {'start': 0.0, 'end': 1.0, 'text': "A"},
+            {'start': 1.0, 'end': 2.0, 'text': "B"},
+            {'start': 2.0, 'end': 3.0, 'text': "C"},
+        ]
+        translated = [
+            {'start': 0.0, 'end': 1.0, 'text': "甲"},
+        ]
+        logs = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = os.path.join(tmp_dir, "out.srt")
+            subtitle_formatter.generate_bilingual_srt(original, translated, out, progress_callback=logs.append)
+            content = self._read(out)
+
+        # All three originals appear with their own timing.
+        self.assertIn("00:00:00,000 --> 00:00:01,000", content)
+        self.assertIn("00:00:01,000 --> 00:00:02,000", content)
+        self.assertIn("00:00:02,000 --> 00:00:03,000", content)
+        # Never a 00:00:00,000 --> 00:00:00,000 entry.
+        self.assertEqual(content.count("00:00:00,000 --> 00:00:00,000"), 0)
+        # A mismatch warning was logged.
+        self.assertTrue(any("mismatch" in m for m in logs))
+
+    def test_original_shorter_uses_translated_timing_no_zero_entries(self):
+        original = [
+            {'start': 0.0, 'end': 1.0, 'text': "A"},
+        ]
+        translated = [
+            {'start': 0.0, 'end': 1.0, 'text': "甲"},
+            {'start': 1.5, 'end': 2.5, 'text': "乙"},
+            {'start': 3.0, 'end': 4.0, 'text': "丙"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = os.path.join(tmp_dir, "out.srt")
+            subtitle_formatter.generate_bilingual_srt(original, translated, out)
+            content = self._read(out)
+
+        # Translated entries beyond the originals keep their own timing,
+        # not the dreaded 00:00:00,000 placeholder.
+        self.assertIn("00:00:01,500 --> 00:00:02,500", content)
+        self.assertIn("00:00:03,000 --> 00:00:04,000", content)
+        self.assertEqual(content.count("00:00:00,000 --> 00:00:00,000"), 0)
+
+    def test_segments_renumbered_sequentially(self):
+        original = [
+            {'start': 0.0, 'end': 1.0, 'text': "A"},
+            {'start': 1.0, 'end': 2.0, 'text': "B"},
+        ]
+        translated = [
+            {'start': 0.0, 'end': 1.0, 'text': "甲"},
+            {'start': 1.0, 'end': 2.0, 'text': "乙"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = os.path.join(tmp_dir, "out.srt")
+            subtitle_formatter.generate_bilingual_srt(original, translated, out)
+            content = self._read(out)
+
+        # Entries are numbered 1, 2 (not 0-indexed, no gaps).
+        self.assertTrue(content.startswith("1\n"))
+        self.assertIn("\n2\n", content)
+
+    def test_missing_timing_entries_skipped_not_zeroed(self):
+        original = [
+            {'start': 0.0, 'end': 1.0, 'text': "A"},
+            {'text': "Lost"},  # No start/end — should be skipped.
+            {'start': 2.0, 'end': 3.0, 'text': "C"},
+        ]
+        translated = [
+            {'start': 0.0, 'end': 1.0, 'text': "甲"},
+            {'text': "丢失"},
+            {'start': 2.0, 'end': 3.0, 'text': "丙"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = os.path.join(tmp_dir, "out.srt")
+            subtitle_formatter.generate_bilingual_srt(original, translated, out)
+            content = self._read(out)
+
+        # The 'Lost' entry has no timing on either side — skipped, not zeroed.
+        self.assertNotIn("Lost", content)
+        self.assertNotIn("丢失", content)
+        self.assertEqual(content.count("00:00:00,000 --> 00:00:00,000"), 0)
+        # The two valid entries are renumbered 1 and 2.
+        self.assertTrue(content.startswith("1\n"))
+        self.assertIn("\n2\n", content)
+
+
+class TestValidateOpenAIApiKey(unittest.TestCase):
+    def test_real_looking_key_accepted(self):
+        ok, key, reason = youtube_subtitle_trans.validate_openai_api_key("sk-proj-abcdefghijklmnop")
+        self.assertTrue(ok)
+        self.assertEqual(key, "sk-proj-abcdefghijklmnop")
+        self.assertIsNone(reason)
+
+    def test_whitespace_and_quotes_trimmed(self):
+        ok, key, _ = youtube_subtitle_trans.validate_openai_api_key('  "sk-abc123"  \n')
+        self.assertTrue(ok)
+        self.assertEqual(key, "sk-abc123")
+
+    def test_none_rejected_with_actionable_reason(self):
+        ok, key, reason = youtube_subtitle_trans.validate_openai_api_key(None)
+        self.assertFalse(ok)
+        self.assertIsNone(key)
+        self.assertIn("OPENAI_API_KEY", reason)
+
+    def test_empty_string_rejected(self):
+        ok, _, reason = youtube_subtitle_trans.validate_openai_api_key("")
+        self.assertFalse(ok)
+        self.assertIn("empty", reason.lower())
+
+    def test_whitespace_only_rejected(self):
+        ok, _, reason = youtube_subtitle_trans.validate_openai_api_key("   \t\n")
+        self.assertFalse(ok)
+        self.assertIn("empty", reason.lower())
+
+    def test_placeholder_template_rejected(self):
+        for placeholder in ["YOUR_OPENAI_API_KEY", "your_openai_api_key", "sk-YOUR_API_KEY-xxx", "REPLACE_ME_PLEASE"]:
+            with self.subTest(placeholder=placeholder):
+                ok, _, reason = youtube_subtitle_trans.validate_openai_api_key(placeholder)
+                self.assertFalse(ok, f"Expected rejection for {placeholder!r}")
+                self.assertIn("placeholder", reason.lower())
+
+    def test_old_check_substring_no_longer_collides(self):
+        # The old code used `"YOUR_OPENAI_API_KEY" in api_key` which is also
+        # what the new check does — but the new check is case-insensitive and
+        # covers a wider set of placeholders, so real keys that incidentally
+        # contained the substring would have been rejected. Make sure the
+        # check still works on a literal pasted-template value.
+        ok, _, _ = youtube_subtitle_trans.validate_openai_api_key("sk-real-key-1234567890")
+        self.assertTrue(ok)
+
+    def test_custom_proxy_key_accepted(self):
+        # Azure / self-hosted proxies often use non-'sk-' prefixes — we
+        # explicitly do NOT block them.
+        ok, key, _ = youtube_subtitle_trans.validate_openai_api_key("azure-proxy-key-abcd1234")
+        self.assertTrue(ok)
+        self.assertEqual(key, "azure-proxy-key-abcd1234")
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,5 +1,8 @@
 import os
+import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,6 +34,11 @@ _VALID_TRANSCRIPTION_MODELS = {
     TRANSCRIPTION_MODEL_TYPHOON,
 }
 _TYPHOON_PIPELINE = None
+# Guards the Typhoon pipeline lazy-init. The pipeline downloads a multi-GB
+# model and allocates GPU/CPU memory — without serialization, two concurrent
+# callers (e.g. the GUI thread plus a background thread) would each trigger a
+# full download and overwrite each other's `_TYPHOON_PIPELINE`.
+_TYPHOON_PIPELINE_LOCK = threading.Lock()
 
 
 class TranscriptResult:
@@ -92,46 +100,67 @@ def _select_torch_device(torch_module):
 
 
 def _get_typhoon_pipeline(progress_callback=print):
+    """
+    Lazily build and cache the Typhoon ASR pipeline. Thread-safe via
+    double-checked locking: the fast path (pipeline already built) is lock-free,
+    and concurrent first-time callers are serialized so the model is downloaded
+    and loaded into memory exactly once.
+    """
     global _TYPHOON_PIPELINE
-    if _TYPHOON_PIPELINE is not None:
+
+    # Fast path: already initialized. Reading a module-level binding is atomic
+    # in CPython, so this is safe without holding the lock.
+    pipe = _TYPHOON_PIPELINE
+    if pipe is not None:
+        return pipe
+
+    with _TYPHOON_PIPELINE_LOCK:
+        # Re-check under the lock: another thread may have built the pipeline
+        # while we were waiting.
+        if _TYPHOON_PIPELINE is not None:
+            return _TYPHOON_PIPELINE
+
+        try:
+            import torch
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+        except ImportError as e:
+            raise RuntimeError(
+                "Missing optional dependencies for Typhoon ASR. "
+                "Install with: pip install transformers accelerate huggingface_hub"
+            ) from e
+
+        device, torch_dtype = _select_torch_device(torch)
+        _report(progress_callback, f"Loading Typhoon ASR model: {TYPHOON_HF_MODEL_ID} ({device})")
+        started = time.perf_counter()
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            TYPHOON_HF_MODEL_ID,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        model.to(device)
+        processor = AutoProcessor.from_pretrained(TYPHOON_HF_MODEL_ID)
+
+        # Publish to the global only after the pipeline is fully constructed.
+        # Assigning a half-built object would let other threads observe an
+        # incomplete pipeline if construction raised midway.
+        built_pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            max_new_tokens=448,
+            chunk_length_s=30,
+            batch_size=16,
+            return_timestamps=True,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
+        _TYPHOON_PIPELINE = built_pipeline
+
+        _report(progress_callback, f"Typhoon ASR model loaded in {time.perf_counter() - started:.1f}s.")
         return _TYPHOON_PIPELINE
-
-    try:
-        import torch
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-    except ImportError as e:
-        raise RuntimeError(
-            "Missing optional dependencies for Typhoon ASR. "
-            "Install with: pip install transformers accelerate huggingface_hub"
-        ) from e
-
-    device, torch_dtype = _select_torch_device(torch)
-    _report(progress_callback, f"Loading Typhoon ASR model: {TYPHOON_HF_MODEL_ID} ({device})")
-    started = time.perf_counter()
-
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        TYPHOON_HF_MODEL_ID,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-    )
-    model.to(device)
-    processor = AutoProcessor.from_pretrained(TYPHOON_HF_MODEL_ID)
-
-    _TYPHOON_PIPELINE = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        max_new_tokens=448,
-        chunk_length_s=30,
-        batch_size=16,
-        return_timestamps=True,
-        torch_dtype=torch_dtype,
-        device=device,
-    )
-    _report(progress_callback, f"Typhoon ASR model loaded in {time.perf_counter() - started:.1f}s.")
-    return _TYPHOON_PIPELINE
 
 
 def _coerce_timestamp_pair(timestamp):
@@ -353,17 +382,39 @@ def _extract_segment(audio_file_path, start_ms, end_ms, output_path):
         return False
 
 
-def _transcribe_single_segment_google(api_key, audio_file_path, seg_index, start_ms, end_ms, lang_code='th-TH'):
+def _chunk_path(work_dir, audio_file_path, seg_index, ext):
+    """Build a deterministic per-segment chunk path inside the job's temp dir."""
+    base = os.path.basename(audio_file_path) or "audio"
+    name = f"{base}_seg_{seg_index}.{ext.lstrip('.')}"
+    if work_dir:
+        return os.path.join(work_dir, name)
+    # Backwards-compatible fallback: write next to the source audio.
+    return f"{audio_file_path}_seg_{seg_index}.{ext.lstrip('.')}"
+
+
+def _remove_quietly(path):
+    """Delete a file ignoring 'already gone' errors; log other OS errors."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"  Warning: could not remove temp file {path}: {e}")
+
+
+def _transcribe_single_segment_google(api_key, audio_file_path, seg_index, start_ms, end_ms, lang_code='th-TH', work_dir=None):
     """
     Transcribe a single <60s segment using Google Speech API Key (REST).
     Uses word-level timestamps to split into subtitle-sized segments.
     """
     import base64
     import requests
-    
+
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
-    chunk_path_flac = f"{audio_file_path}_seg_{seg_index}.flac"
+    chunk_path_flac = _chunk_path(work_dir, audio_file_path, seg_index, "flac")
     started = time.perf_counter()
     
     # Max words per subtitle line (Thai words are short, so allow more)
@@ -485,25 +536,25 @@ def _transcribe_single_segment_google(api_key, audio_file_path, seg_index, start
         print(f"  Error Google transcribing segment {seg_index+1}: {e}")
         return (seg_index, [])
     finally:
-        if os.path.exists(chunk_path_flac):
-            os.remove(chunk_path_flac)
+        _remove_quietly(chunk_path_flac)
 
 
-def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end_ms, source_lang=None, whisper_prompt=None):
+def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end_ms, source_lang=None, whisper_prompt=None, work_dir=None):
     """
     Extract and transcribe a single audio segment.
     Returns (seg_index, list_of_segments_with_absolute_timestamps) or (seg_index, []) on error.
     """
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
-    chunk_path = f"{audio_file_path}_seg_{seg_index}.m4a"
+    chunk_path = _chunk_path(work_dir, audio_file_path, seg_index, "m4a")
     started = time.perf_counter()
-    
-    # Extract segment
-    if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
-        return (seg_index, [])
-    
+
     try:
+        # Extract first. Even if extraction fails partway (e.g. ffmpeg killed,
+        # disk full), the finally block below will clean up any partial file.
+        if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
+            return (seg_index, [])
+
         # Transcribe
         with open(chunk_path, "rb") as af:
             whisper_kwargs = {
@@ -541,13 +592,12 @@ def _transcribe_single_segment(client, audio_file_path, seg_index, start_ms, end
         print(f"  Segment {seg_index+1}: {len(result_segments)} text segments "
               f"({start_sec:.0f}s-{start_sec+duration_sec:.0f}s, lang={source_lang or 'auto'}, {time.perf_counter() - started:.1f}s)")
         return (seg_index, result_segments)
-        
+
     except Exception as e:
         print(f"  Error transcribing segment {seg_index+1}: {e}")
         return (seg_index, [])
     finally:
-        if os.path.exists(chunk_path):
-            os.remove(chunk_path)
+        _remove_quietly(chunk_path)
 
 
 def _get_transcript_segments(transcript):
@@ -619,20 +669,20 @@ def _transcribe_diarize_file(client, audio_file_path, time_offset=0.0, fallback_
     return segments
 
 
-def _transcribe_single_segment_diarize(client, audio_file_path, seg_index, start_ms, end_ms):
+def _transcribe_single_segment_diarize(client, audio_file_path, seg_index, start_ms, end_ms, work_dir=None):
     """
     Extract and transcribe a segment with GPT-4o diarized transcription.
     Speaker labels are ignored; start/end/text are normalized for SRT generation.
     """
     start_sec = start_ms / 1000.0
     duration_sec = (end_ms - start_ms) / 1000.0
-    chunk_path = f"{audio_file_path}_seg_{seg_index}.m4a"
+    chunk_path = _chunk_path(work_dir, audio_file_path, seg_index, "m4a")
     started = time.perf_counter()
 
-    if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
-        return (seg_index, [])
-
     try:
+        if not _extract_segment(audio_file_path, start_ms, end_ms, chunk_path):
+            return (seg_index, [])
+
         result_segments = _transcribe_diarize_file(
             client,
             chunk_path,
@@ -646,8 +696,7 @@ def _transcribe_single_segment_diarize(client, audio_file_path, seg_index, start
         print(f"  Error transcribing segment {seg_index+1} with gpt-4o diarize: {e}")
         return (seg_index, [])
     finally:
-        if os.path.exists(chunk_path):
-            os.remove(chunk_path)
+        _remove_quietly(chunk_path)
 
 
 def transcribe_audio(
@@ -679,6 +728,16 @@ def transcribe_audio(
     """
     if not os.path.exists(audio_file_path):
         raise FileNotFoundError(f"Audio file not found: {audio_file_path}")
+
+    # Per-job scratch directory. Every chunk extracted by a worker lives here,
+    # so the top-level `finally` below can wipe everything in one shot — even
+    # if the run is aborted partway (uncaught exception, KeyboardInterrupt,
+    # ThreadPoolExecutor worker crash). This replaces a previous pattern that
+    # leaked `_seg_N.m4a` files next to the source audio on abnormal exits.
+    work_dir = tempfile.mkdtemp(prefix="llm_subs_transcribe_")
+    # Chunks produced by audio_splitter.split_audio() live next to the source
+    # audio (it uses a fixed naming convention), so we track them separately.
+    splitter_chunks_to_remove = []
 
     try:
         transcription_started = time.perf_counter()
@@ -757,17 +816,20 @@ def transcribe_audio(
                     if engine == 'google':
                         future = executor.submit(
                             _transcribe_single_segment_google,
-                            google_api_key, audio_file_path, i, start_ms, end_ms, google_lang
+                            google_api_key, audio_file_path, i, start_ms, end_ms, google_lang,
+                            work_dir,
                         )
                     elif use_openai_diarize:
                         future = executor.submit(
                             _transcribe_single_segment_diarize,
-                            client, audio_file_path, i, start_ms, end_ms
+                            client, audio_file_path, i, start_ms, end_ms,
+                            work_dir,
                         )
                     else:
                         future = executor.submit(
                             _transcribe_single_segment,
-                            client, audio_file_path, i, start_ms, end_ms, source_lang, whisper_prompt
+                            client, audio_file_path, i, start_ms, end_ms, source_lang, whisper_prompt,
+                            work_dir,
                         )
                     futures[future] = i
                 
@@ -794,8 +856,13 @@ def transcribe_audio(
             split_started = time.perf_counter()
             chunks = audio_splitter.split_audio(audio_file_path)
             print(f"Audio split step returned {len(chunks)} chunk(s) in {time.perf_counter() - split_started:.1f}s.")
+            # Register splitter outputs for cleanup. Skip the input file itself
+            # (audio_splitter returns [audio_file_path] when no split is needed).
+            for chunk in chunks:
+                if chunk != audio_file_path:
+                    splitter_chunks_to_remove.append(chunk)
             time_offset = 0.0
-            
+
             for i, chunk_path in enumerate(chunks):
                 chunk_started = time.perf_counter()
                 before_chunk_segments = len(all_segments)
@@ -848,11 +915,11 @@ def transcribe_audio(
                 print(f"Finished transcribing chunk {i+1}/{len(chunks)} in {time.perf_counter() - chunk_started:.1f}s "
                       f"({len(all_segments) - before_chunk_segments} new segments).")
                 
+                # Best-effort early cleanup to bound disk usage during long
+                # runs. The top-level `finally` is the safety net for files
+                # that survive (e.g. on KeyboardInterrupt before this point).
                 if chunk_path != audio_file_path:
-                    try:
-                        os.remove(chunk_path)
-                    except:
-                        pass
+                    _remove_quietly(chunk_path)
 
         # Filter hallucinations
         filtered_segments = _filter_hallucinations(all_segments)
@@ -870,3 +937,15 @@ def transcribe_audio(
             import traceback
             traceback.print_exc()
         return None
+    finally:
+        # Safety net: workers should clean their own chunks in `_remove_quietly`,
+        # but on KeyboardInterrupt / unexpected aborts that path can be skipped.
+        # Wiping the whole scratch dir guarantees no orphans linger.
+        for chunk in splitter_chunks_to_remove:
+            _remove_quietly(chunk)
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            # rmtree(..., ignore_errors=True) shouldn't raise, but defend
+            # against pathological filesystems just in case.
+            pass
