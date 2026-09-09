@@ -11,5 +11,31 @@ __pycache__/
 # Generated outputs
 output/
 
+# Local hard-subtitle acceptance case URLs
+testdata/hard_subtitles/youtube_cases.local.json
+
 # macOS
 .DS_Store
+
+# Local subtitle audio alignment runtime and downloaded models
+.venv-subtitle-alignment/
+.cache/subtitle_models/
+
+# Local project evidence and deliveries; retain all project helper source code.
+/Subtitle Projects/**
+!/Subtitle Projects/**/
+!/Subtitle Projects/**/*.py
+!/Subtitle Projects/**/*.sh
+!/Subtitle Projects/**/*.swift
+!/Subtitle Projects/**/*.js
+!/Subtitle Projects/**/*.command
+!/Subtitle Projects/**/*.bat
+/Subtitle Projects/**/__pycache__/
+
+# Local reference transcripts and runtime artifacts
+/transcript/
+.cache/
+.venv-*/
+.pytest_cache/
+eval_results/
+*.log

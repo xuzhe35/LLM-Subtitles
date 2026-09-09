@@ -2,5 +2,21 @@
   "openai_api_key": "YOUR_OPENAI_API_KEY",
   "google_api_key": "YOUR_GOOGLE_API_KEY",
   "default_target_language": "Simplified Chinese",
-  "model": "gpt-4o"
+  "model": "gpt-realtime-translate",
+  "polish_realtime_subtitles": true,
+  "polish_model": "gpt-5.6",
+  "pipeline": "realtime",
+  "high_quality": {
+    "semantic_model": "gpt-transcribe",
+    "timing_model": "auto",
+    "source_languages": ["th", "en"],
+    "prompt": "",
+    "keywords": [],
+    "context_model": "gpt-5.6-terra",
+    "translation_model": "gpt-5.6-terra",
+    "translation_escalation_model": "gpt-5.6-sol",
+    "translation_reasoning_effort": "medium",
+    "enable_selective_escalation": true,
+    "strict": true
+  }
 }

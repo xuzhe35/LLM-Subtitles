@@ -4,6 +4,73 @@ import os
 DEFAULT_MAX_LINE_CHARS = 32
 _BREAK_AFTER_CHARS = set("，。！？；：、,.!?;:")
 
+# Display-time extension: cue end times from the timing backbone mark where
+# the *matched* speech evidence ends, which can be well before the speech
+# itself ends (garbled ASR tails carry no timestamps). Extending the display
+# window into the following gap keeps subtitles readable without ever
+# overlapping the next cue. Reading rates are conservative chars-per-second
+# guidelines; dense scripts (CJK) read fewer characters per second.
+CJK_READ_CHARS_PER_SEC = 9.0
+DEFAULT_READ_CHARS_PER_SEC = 15.0
+MIN_SUBTITLE_DURATION_SEC = 1.0
+MAX_EXTENDED_DURATION_SEC = 12.0
+
+_DENSE_SCRIPT_RE = re.compile(
+    "[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]"
+)
+
+
+def _reading_time_needed_sec(text):
+    """Seconds a viewer needs for this cue, by script-aware reading rate."""
+    visible = "".join(str(text or "").split())
+    if not visible:
+        return 0.0
+    dense = len(_DENSE_SCRIPT_RE.findall(visible))
+    rate = (CJK_READ_CHARS_PER_SEC if dense >= len(visible) / 3
+            else DEFAULT_READ_CHARS_PER_SEC)
+    needed = max(MIN_SUBTITLE_DURATION_SEC, len(visible) / rate)
+    return min(needed, MAX_EXTENDED_DURATION_SEC)
+
+
+def extend_display_times(segments, media_duration=None):
+    """Give each cue its reading time without moving evidence it contradicts.
+
+    Forward pass: every cue's end may extend into the following gap up to its
+    reading need; it never overlaps the next cue and never shrinks. Backward
+    pass: only cues marked ``extend_lead`` (speech with no timing evidence
+    before the matched span) may start earlier, into whatever gap the
+    previous cue left — appearance times otherwise stay exactly on evidence.
+    The final cue is capped by ``media_duration``. Without a known duration,
+    its evidence end is preserved instead of guessing beyond the media. The
+    ``extend_lead`` marker is consumed. Returns new segment dicts.
+    """
+    result = [dict(segment) for segment in segments]
+    for index, segment in enumerate(result):
+        needed = _reading_time_needed_sec(segment.get("text"))
+        if needed <= 0.0:
+            continue
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if index + 1 < len(result):
+            limit = float(result[index + 1]["start"])
+        elif media_duration is not None:
+            limit = max(end, float(media_duration))
+        else:
+            limit = end
+        segment["end"] = max(end, min(start + needed, limit))
+    for index, segment in enumerate(result):
+        wants_lead = bool(segment.pop("extend_lead", False))
+        if not wants_lead:
+            continue
+        needed = _reading_time_needed_sec(segment.get("text"))
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if end - start >= needed:
+            continue
+        floor = float(result[index - 1]["end"]) if index > 0 else 0.0
+        segment["start"] = min(start, max(floor, end - needed))
+    return result
+
 def format_timestamp(seconds):
     """
     Converts seconds to SRT timestamp format (00:00:00,000).

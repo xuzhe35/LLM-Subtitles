@@ -1,9 +1,6 @@
 import os
 import sys
 import tempfile
-import threading
-import time
-import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -25,19 +22,19 @@ class TestTranscriptionModelResolution(unittest.TestCase):
             transcriber.TRANSCRIPTION_MODEL_GOOGLE,
         )
         self.assertEqual(
-            transcriber.resolve_transcription_model("typhoon", "en"),
-            transcriber.TRANSCRIPTION_MODEL_TYPHOON,
-        )
-        self.assertEqual(
             transcriber.resolve_transcription_model("gpt-4o-transcribe-diarize", "th"),
             transcriber.TRANSCRIPTION_MODEL_OPENAI_GPT4O_DIARIZE,
         )
 
-    def test_auto_engine_still_routes_thai_source_to_typhoon(self):
+    def test_auto_engine_routes_thai_source_to_openai(self):
         self.assertEqual(
             transcriber.resolve_transcription_model("auto", "th"),
-            transcriber.TRANSCRIPTION_MODEL_TYPHOON,
+            transcriber.TRANSCRIPTION_MODEL_OPENAI,
         )
+
+    def test_unknown_engine_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported transcription engine"):
+            transcriber.resolve_transcription_model("removed-local-engine", "th")
 
     def test_non_thai_source_keeps_existing_engine_behavior(self):
         self.assertEqual(
@@ -48,168 +45,6 @@ class TestTranscriptionModelResolution(unittest.TestCase):
             transcriber.resolve_transcription_model("google", "en"),
             transcriber.TRANSCRIPTION_MODEL_GOOGLE,
         )
-
-
-class TestTyphoonTranscription(unittest.TestCase):
-    def test_torch_device_selection_prefers_cuda_then_mps_then_cpu(self):
-        torch_module = MagicMock()
-        torch_module.bfloat16 = "bfloat16"
-        torch_module.float16 = "float16"
-        torch_module.float32 = "float32"
-
-        torch_module.cuda.is_available.return_value = True
-        self.assertEqual(("cuda:0", "bfloat16"), transcriber._select_torch_device(torch_module))
-
-        torch_module.cuda.is_available.return_value = False
-        torch_module.backends.mps.is_available.return_value = True
-        self.assertEqual(("mps", "float16"), transcriber._select_torch_device(torch_module))
-
-        torch_module.backends.mps.is_available.return_value = False
-        self.assertEqual(("cpu", "float32"), transcriber._select_torch_device(torch_module))
-
-    def test_typhoon_pipeline_chunks_are_normalized_to_segments(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            audio_path = os.path.join(tmp_dir, "audio.wav")
-            with open(audio_path, "wb") as f:
-                f.write(b"fake audio")
-
-            fake_pipe = MagicMock(return_value={
-                "text": "sawatdee lok",
-                "chunks": [
-                    {"timestamp": (0.0, 1.2), "text": " sawatdee "},
-                    {"timestamp": (1.2, 2.5), "text": "lok"},
-                ],
-            })
-
-            with patch.object(transcriber, "_get_typhoon_pipeline", return_value=fake_pipe):
-                result = transcriber.transcribe_audio(
-                    MagicMock(),
-                    audio_path,
-                    source_lang="th",
-                    transcription_model=transcriber.TRANSCRIPTION_MODEL_TYPHOON,
-                )
-
-        self.assertEqual([
-            {"start": 0.0, "end": 1.2, "text": "sawatdee"},
-            {"start": 1.2, "end": 2.5, "text": "lok"},
-        ], result.segments)
-        fake_pipe.assert_called_once_with(
-            audio_path,
-            generate_kwargs={"language": "thai"},
-        )
-
-    def test_pipeline_initialization_is_thread_safe(self):
-        """
-        Concurrent callers of `_get_typhoon_pipeline` must build the pipeline
-        exactly once — without the lock, two threads would each download the
-        multi-GB model and overwrite each other's `_TYPHOON_PIPELINE`.
-        """
-        N_THREADS = 8
-
-        # Reset the module-level cache so we exercise the init path.
-        transcriber._TYPHOON_PIPELINE = None
-
-        init_count = {"n": 0}
-        # Used to widen the race window: hold every thread at the start of
-        # init until they're all in flight.
-        all_threads_started = threading.Event()
-
-        def fake_pipeline_factory(*args, **kwargs):
-            init_count["n"] += 1
-            # Block until every worker is actively trying to init. Without the
-            # lock, all N would race through this and each call the factory.
-            all_threads_started.wait(timeout=2.0)
-            return SimpleNamespace(_id=init_count["n"])
-
-        fake_model = MagicMock()
-        fake_model.to.return_value = fake_model
-
-        fake_torch = types.SimpleNamespace(
-            cuda=SimpleNamespace(is_available=lambda: False),
-            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
-            bfloat16="bfloat16",
-            float16="float16",
-            float32="float32",
-        )
-
-        fake_transformers = types.SimpleNamespace(
-            AutoModelForSpeechSeq2Seq=SimpleNamespace(from_pretrained=lambda *a, **kw: fake_model),
-            AutoProcessor=SimpleNamespace(from_pretrained=lambda *a, **kw: SimpleNamespace(
-                tokenizer=MagicMock(), feature_extractor=MagicMock()
-            )),
-            pipeline=fake_pipeline_factory,
-        )
-
-        results = [None] * N_THREADS
-        barrier = threading.Barrier(N_THREADS)
-
-        def worker(idx):
-            barrier.wait()  # release all threads at once
-            results[idx] = transcriber._get_typhoon_pipeline(progress_callback=lambda _msg: None)
-
-        try:
-            with patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
-                threads = [threading.Thread(target=worker, args=(i,)) for i in range(N_THREADS)]
-                for t in threads:
-                    t.start()
-                # Brief sleep so the first thread can reach `wait()` inside
-                # the factory; then release.
-                time.sleep(0.05)
-                all_threads_started.set()
-                for t in threads:
-                    t.join(timeout=5.0)
-                    self.assertFalse(t.is_alive(), "worker thread hung")
-        finally:
-            transcriber._TYPHOON_PIPELINE = None
-
-        # Exactly one initialization — the whole point of the lock.
-        self.assertEqual(1, init_count["n"])
-        # Every caller observes the same pipeline instance.
-        self.assertTrue(all(r is results[0] for r in results))
-        self.assertIsNotNone(results[0])
-
-    def test_failed_init_allows_retry(self):
-        """
-        If pipeline construction raises, the global must stay None so the
-        next call can retry — not get stuck with a half-built object.
-        """
-        transcriber._TYPHOON_PIPELINE = None
-        try:
-            with patch.dict(sys.modules, {}, clear=False):
-                # Force ImportError on transformers to simulate missing deps.
-                sys.modules.pop("transformers", None)
-                with patch.dict(sys.modules, {"transformers": None}):
-                    with self.assertRaises((RuntimeError, ImportError)):
-                        transcriber._get_typhoon_pipeline(progress_callback=lambda _msg: None)
-            self.assertIsNone(transcriber._TYPHOON_PIPELINE)
-        finally:
-            transcriber._TYPHOON_PIPELINE = None
-
-    def test_missing_typhoon_dependencies_return_clear_error_without_openai_call(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            audio_path = os.path.join(tmp_dir, "audio.wav")
-            with open(audio_path, "wb") as f:
-                f.write(b"fake audio")
-
-            client = MagicMock()
-            logs = []
-            missing_error = RuntimeError(
-                "Missing optional dependencies for Typhoon ASR. "
-                "Install with: pip install transformers accelerate huggingface_hub"
-            )
-
-            with patch.object(transcriber, "_get_typhoon_pipeline", side_effect=missing_error):
-                result = transcriber.transcribe_audio(
-                    client,
-                    audio_path,
-                    source_lang="th",
-                    transcription_model=transcriber.TRANSCRIPTION_MODEL_TYPHOON,
-                    progress_callback=logs.append,
-                )
-
-        self.assertIsNone(result)
-        self.assertFalse(client.audio.transcriptions.create.called)
-        self.assertTrue(any("transformers accelerate huggingface_hub" in msg for msg in logs))
 
 
 class TestTempFileCleanup(unittest.TestCase):
@@ -426,55 +261,7 @@ class TestResolveOutputDir(unittest.TestCase):
         self.assertEqual(result, os.path.abspath(tmp_dir))
 
 
-class TestProcessVideoTyphoonRouting(unittest.TestCase):
-    def test_explicit_typhoon_route_does_not_require_google_api_key(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            logs = []
-            transcribe_kwargs = {}
-
-            def fake_download_audio(url, output_path, progress_hook=None):
-                path = output_path + ".mp3"
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(b"fake audio")
-                return path
-
-            def fake_transcribe_audio(*args, **kwargs):
-                transcribe_kwargs.update(kwargs)
-
-                class TranscriptResult:
-                    segments = [
-                        {"start": 0.0, "end": 1.0, "text": "sawatdee"},
-                    ]
-
-                return TranscriptResult()
-
-            with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
-                 patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
-                 patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "Thai Demo", "subtitles": {}}), \
-                 patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
-                 patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
-                 patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
-                     {"start": 0.0, "end": 1.0, "text": "hello"},
-                 ]):
-                youtube_subtitle_trans.process_video(
-                    "https://example.com/video",
-                    lang="Simplified Chinese",
-                    model="gpt-4o",
-                    force_audio=True,
-                    source_lang="th",
-                    engine="typhoon",
-                    progress_callback=logs.append,
-                    output_dir=tmp_dir,
-                )
-
-        self.assertEqual(
-            transcriber.TRANSCRIPTION_MODEL_TYPHOON,
-            transcribe_kwargs["transcription_model"],
-        )
-        self.assertFalse(any("Google engine requires" in msg for msg in logs))
-        self.assertTrue(any("Resolved transcription model: typhoon-whisper-large-v3" in msg for msg in logs))
-
+class TestProcessVideoTranscriptionRouting(unittest.TestCase):
     def test_explicit_gpt4o_diarize_route_is_respected(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             logs = []
@@ -521,6 +308,90 @@ class TestProcessVideoTyphoonRouting(unittest.TestCase):
             transcribe_kwargs["transcription_model"],
         )
         self.assertTrue(any("Resolved transcription model: gpt-4o-transcribe-diarize" in msg for msg in logs))
+
+
+class TestProcessVideoAudioEnhancement(unittest.TestCase):
+    def _run_process_with_audio_enhancement(self, enhance_audio=False, enhance_mode="mild",
+                                            enhancer_side_effect=None):
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        logs = []
+        captured = {}
+
+        def fake_download_audio(url, output_path, progress_hook=None):
+            path = output_path + ".mp3"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"fake audio")
+            captured["raw_audio_path"] = path
+            return path
+
+        def fake_transcribe_audio(*args, **kwargs):
+            captured["transcribe_audio_path"] = args[1]
+
+            class TranscriptResult:
+                segments = [
+                    {"start": 0.0, "end": 1.0, "text": "hello"},
+                ]
+
+            return TranscriptResult()
+
+        enhancer = MagicMock()
+        if enhancer_side_effect is not None:
+            enhancer.side_effect = enhancer_side_effect
+        else:
+            enhancer.side_effect = lambda input_path, output_path, **_kwargs: output_path
+
+        with patch.object(youtube_subtitle_trans, "load_config", return_value={"openai_api_key": "sk-test"}), \
+             patch.object(youtube_subtitle_trans, "OpenAI", return_value=MagicMock()), \
+             patch.object(youtube_subtitle_trans.downloader, "get_video_info", return_value={"title": "Noisy Thai", "subtitles": {}}), \
+             patch.object(youtube_subtitle_trans.downloader, "download_audio", side_effect=fake_download_audio), \
+             patch.object(youtube_subtitle_trans.audio_enhancer, "enhance_audio", enhancer), \
+             patch.object(youtube_subtitle_trans.transcriber, "transcribe_audio", side_effect=fake_transcribe_audio), \
+             patch.object(youtube_subtitle_trans.translator, "translate_segments", return_value=[
+                 {"start": 0.0, "end": 1.0, "text": "你好"},
+             ]):
+            youtube_subtitle_trans.process_video(
+                "https://example.com/video",
+                lang="Simplified Chinese",
+                model="gpt-4o",
+                force_audio=True,
+                source_lang="th",
+                engine="whisper",
+                progress_callback=logs.append,
+                output_dir=tmp_dir.name,
+                enhance_audio=enhance_audio,
+                enhance_mode=enhance_mode,
+            )
+
+        return captured, enhancer, logs
+
+    def test_enhancement_off_passes_raw_audio_to_transcriber(self):
+        captured, enhancer, _logs = self._run_process_with_audio_enhancement(enhance_audio=False)
+
+        self.assertEqual(captured["raw_audio_path"], captured["transcribe_audio_path"])
+        enhancer.assert_not_called()
+
+    def test_enhancement_on_passes_enhanced_audio_to_transcriber(self):
+        captured, enhancer, _logs = self._run_process_with_audio_enhancement(
+            enhance_audio=True,
+            enhance_mode="mild",
+        )
+
+        self.assertNotEqual(captured["raw_audio_path"], captured["transcribe_audio_path"])
+        self.assertTrue(captured["transcribe_audio_path"].endswith(".enhanced.mild.wav"))
+        enhancer.assert_called_once()
+
+    def test_enhancement_failure_falls_back_to_raw_audio(self):
+        captured, enhancer, logs = self._run_process_with_audio_enhancement(
+            enhance_audio=True,
+            enhance_mode="mild",
+            enhancer_side_effect=RuntimeError("ffmpeg failed"),
+        )
+
+        self.assertEqual(captured["raw_audio_path"], captured["transcribe_audio_path"])
+        enhancer.assert_called_once()
+        self.assertTrue(any("audio enhancement failed" in msg for msg in logs))
 
 
 class TestOpenAIClientTimeoutAndRetries(unittest.TestCase):

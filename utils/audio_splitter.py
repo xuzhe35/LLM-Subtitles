@@ -1,8 +1,13 @@
 import os
 import subprocess
 import math
+import re
 import shutil
 import time
+
+
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
 
 def get_audio_duration(file_path):
     """
@@ -21,6 +26,52 @@ def get_audio_duration(file_path):
     except Exception as e:
         print(f"Error getting duration: {e}")
         return None
+
+
+def find_silence_boundaries(file_path, *, noise_db=-35, min_silence_sec=0.35):
+    """Return midpoints of detected silence gaps for safer chunk cuts.
+
+    Detection is best-effort. If ffmpeg is unavailable or cannot inspect the
+    input, callers receive an empty list and can retain overlap-based boundary
+    recovery instead of failing the transcription.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        file_path,
+        "-vn",
+        "-af",
+        f"silencedetect=noise={float(noise_db):g}dB:d={float(min_silence_sec):g}",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return []
+
+    boundaries = []
+    silence_start = None
+    for line in (result.stderr or "").splitlines():
+        start_match = _SILENCE_START_RE.search(line)
+        if start_match:
+            silence_start = float(start_match.group(1))
+        end_match = _SILENCE_END_RE.search(line)
+        if end_match and silence_start is not None:
+            silence_end = float(end_match.group(1))
+            if silence_end > silence_start:
+                boundaries.append(round((silence_start + silence_end) / 2.0, 3))
+            silence_start = None
+    return boundaries
 
 def split_audio(file_path, chunk_size_mb=24):
     """

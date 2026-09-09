@@ -1,0 +1,7 @@
+interface:
+  display_name: "硬字幕 OCR 提取"
+  short_description: "显式提取视频硬字幕，保留时间轴、质量报告与图像证据"
+  default_prompt: "Use $hard-subtitle-ocr to extract visible burned-in subtitles from a named Subtitle Projects folder or local video, using the YouTube source timeline when available."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,7 @@
+interface:
+  display_name: "YouTube 字幕工作流"
+  short_description: "融合字幕、已有 OCR、听写与作者资料，生成高质量双语字幕"
+  default_prompt: "Use $youtube-subtitles to process a project under Subtitle Projects, fuse YouTube captions, existing OCR, local transcription, and author reference documents, and produce source-timed Simplified Chinese and bilingual SRT files without paid API calls."
+
+policy:
+  allow_implicit_invocation: true
