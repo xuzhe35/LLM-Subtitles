@@ -1,6 +1,6 @@
 ---
 name: youtube-subtitles
-description: Turn a YouTube URL, a Subtitle Projects folder, or an SRT/VTT transcript into validated translated and bilingual subtitles. Fuse YouTube captions, already-produced OCR, local transcription, and author reference documents with Codex for high-quality translation. Use for subtitle acquisition, transcription, translation, polishing, evidence fusion, or bilingual SRT requests in this repository; use the separate explicit hard-subtitle-ocr skill to extract burned-in subtitles. Default to subscription-backed Codex and never use paid OpenAI APIs unless the user explicitly requests and accepts the legacy API pipeline.
+description: Turn a YouTube URL, a Subtitle Projects folder, or an SRT/VTT transcript into validated translated and bilingual subtitles. Fuse YouTube captions, already-produced OCR, local transcription, and author reference documents with Codex for high-quality translation. Use for subtitle acquisition, transcription, translation, polishing, evidence fusion, audio-based timing calibration, or bilingual SRT requests in this repository; use the separate explicit hard-subtitle-ocr skill to extract burned-in subtitles. Default to subscription-backed Codex and never use paid OpenAI APIs unless the user explicitly requests and accepts the legacy API pipeline.
 ---
 
 # YouTube Subtitles
@@ -14,6 +14,19 @@ Use Codex as the language engine. Use the repository's `codex_subtitles` service
 - YouTube access and a one-time local model download are allowed network operations, but they are not paid OpenAI API calls.
 - If YouTube captions, OCR evidence, and local ASR are all unavailable or unusable, stop and explain the blocker. Do not silently fall back to a paid API.
 - The legacy Realtime/API pipelines remain available only when the user explicitly asks for them and accepts separate API billing.
+
+## Audio timing calibration
+
+When the user reports late/drifting subtitles, requests audio-based timing checks,
+or asks to change timing without changing translation, read
+[audio-alignment.md](references/audio-alignment.md). Use the installed local
+stable-ts / MLX Whisper alignment capability, reuse a suitable downloaded model,
+and take the timing-only path instead of restarting translation. Preserve raw
+source timing evidence and export separately named, text-locked derivatives.
+
+Select the timeline explicitly: the user's requested target takes precedence;
+otherwise follow repository `AGENTS.md` (a supplied local video's elapsed time).
+Do not infer YouTube timing from a local recording without verified mapping.
 
 ## Subtitle Projects evidence workflow
 
@@ -52,7 +65,7 @@ For command details, resume behavior, or importing an existing transcript, read 
 
 ## Non-negotiable subtitle invariants
 
-- Treat source timestamps as immutable evidence. Target files must never contain timestamps.
+- Treat source timestamps as immutable evidence. Translation target JSON files must never contain timestamps. An explicitly requested timing correction creates separate aligned evidence and delivery SRTs; it never edits raw source times or translation text.
 - Cover each owned source cue ID exactly once and in order.
 - Merge only adjacent owned cues, at most eight cues and at most 15 seconds per merged subtitle.
 - Do not merge across speaker changes.

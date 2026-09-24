@@ -30,6 +30,10 @@ URL or multiple different video IDs are present, stop and ask which source is
 correct. A `t=` query parameter is playback context, not proof that recording
 time zero equals that YouTube timestamp.
 
+For timing-only corrections to an existing delivery, follow
+[audio-alignment.md](audio-alignment.md) after inventory and timeline selection;
+skip rebuilding the translation job.
+
 ## Discover deterministically
 
 1. Resolve the project directory named by the user. If no directory is named and
@@ -130,18 +134,23 @@ Determine whether the spoken language and visible-subtitle language are the same
 - Unknown relationship: keep the uncertainty in the evidence ledger and avoid
   unsupported rewrites.
 
-Set the timeline target explicitly in the evidence ledger. For projects with a
-YouTube URL, default to `youtube-source`: source-timed YouTube captions or direct
-source media are the final timing authority. Recording-relative OCR supplies text
-evidence only until aligned. A `t=` URL parameter never establishes an offset.
+Set the timeline target explicitly in the evidence ledger. The user's explicit
+request takes precedence. Otherwise follow repository `AGENTS.md`: when a local
+video is supplied, use that exact video's elapsed time and reviewed visible
+subtitle transitions where available. Record its path and checksum. Use
+`youtube-source` when requested, or when direct YouTube media is the supplied
+media and no local target exists. For a YouTube target, recording-relative OCR
+supplies text evidence only until aligned. A `t=` URL parameter never establishes
+an offset.
 
 Use a constant recording-to-source offset only after verifying at least three
 unambiguous anchors distributed across the beginning, middle, and end. Record the
 anchors and residual error. If offsets drift because of trimming, seeking,
 pauses, dropped frames, or playback speed, do not force a constant offset. Use a
 separate piecewise mapping when available or retain source-timed cues and align
-OCR by content. Only when the requested deliverable explicitly targets the local
-recording should `recording-elapsed` become the final timing basis.
+OCR by content. Never apply a recording-to-YouTube offset to a delivery whose
+selected target is `recording-elapsed`. Recheck the exact local file after edits;
+do not reuse a mapping across cuts without verification.
 
 ## Build the fused source
 
@@ -212,8 +221,9 @@ Before finalization:
 - Check proper names, technical/religious terminology, numbers, negation, and
   sentence joins against all relevant sources.
 - Sample the beginning, middle, end, and every disagreement cluster.
-- Confirm final timing targets the declared playback media. In a URL-backed
-  project this defaults to the original YouTube source, not the recording MP4.
+- Confirm final timing targets the declared playback media under the user's
+  request and repository `AGENTS.md`; the presence of a URL alone does not override
+  a local-video target.
 - Confirm no original evidence file changed.
 - Report which audiovisual and document evidence sources were present, which
   were actually used, unresolved uncertainties, whether local ASR ran, and

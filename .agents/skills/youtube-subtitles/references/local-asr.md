@@ -1,6 +1,8 @@
 # Local ASR fallback
 
-Use this only when `prepare` returns `needs_local_asr` or the user explicitly forces audio.
+Use this for fresh transcription when `prepare` returns `needs_local_asr` or the user explicitly forces audio.
+For timing calibration of reviewed subtitles, use [audio-alignment.md](audio-alignment.md):
+its stable-ts / MLX Whisper route aligns existing text and does not restart translation.
 
 In a `Subtitle Projects` evidence workflow, the existing project MP4 is the
 preferred audio source. Read [project-evidence.md](project-evidence.md); do not
